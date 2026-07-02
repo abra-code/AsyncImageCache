@@ -302,8 +302,21 @@ final class DiskCache: @unchecked Sendable {
         }
     }
 
+    // SHA256 hex of the URL string, used as the on-disk filename. `fileURL(for:)` calls this on EVERY disk
+    // operation (each metadata read, data read, existence check), so the hex encoding is hot: the obvious
+    // `digest.map { String(format: "%02x", $0) }.joined()` measured ~25 us (as much as three getxattr calls
+    // and ~50x the raw hash) because of per-byte String(format:). This table-based encoder is ~1 us and
+    // produces byte-identical lowercase hex, so existing cache filenames are unchanged.
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+
     private static func hash(_ string: String) -> String {
         let digest = SHA256.hash(data: Data(string.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        var chars = [UInt8]()
+        chars.reserveCapacity(SHA256Digest.byteCount * 2)
+        for byte in digest {
+            chars.append(hexDigits[Int(byte >> 4)])
+            chars.append(hexDigits[Int(byte & 0x0f)])
+        }
+        return String(decoding: chars, as: UTF8.self)
     }
 }

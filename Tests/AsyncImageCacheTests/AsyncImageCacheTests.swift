@@ -7,6 +7,7 @@
 import XCTest
 import CoreGraphics
 import ImageIO
+import CryptoKit
 @testable import AsyncImageCache
 
 #if canImport(UIKit)
@@ -398,6 +399,19 @@ final class AsyncImageCacheTests: XCTestCase {
         }
         wait(for: [loaded], timeout: 5)
         XCTAssertNotNil(disk.placeholder(for: url), "a disk-hit load should repair the missing placeholder xattr")
+    }
+
+    // The on-disk filename must stay the canonical lowercase SHA256 hex of the URL. The hex encoder was
+    // optimized (String(format:) -> a table), so pin the output: a drift would silently orphan every existing
+    // cache file (they would all be treated as misses and re-fetched).
+    func testDiskFilenameIsCanonicalSHA256Hex() {
+        let disk = DiskCache(name: uniqueName(), byteLimit: 1024)
+        defer { disk.removeAll() }
+        let url = URL(string: "https://example.test/some/image-42.png")!
+        let expected = SHA256.hash(data: Data(url.absoluteString.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(disk.fileURL(for: url).lastPathComponent, expected)
+        XCTAssertEqual(expected.count, 64)
     }
 
     // MARK: - Animated detection + placeholder image
