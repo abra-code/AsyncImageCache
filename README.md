@@ -1,7 +1,6 @@
 # AsyncImageCache
 
-A small, reusable async image loading + caching component for iOS / macOS / visionOS. It is NOT tied to
-RichText - it is shipped as a separate SPM library product so any consumer (RichText inline images, an
+A small, reusable async image loading + caching component for iOS / macOS / visionOS. Shipped as a separate SPM library product so any consumer (RichText inline images, an
 ActionUIChat image bubble, a standalone image element) can depend on just this.
 
 Two design goals drive everything:
