@@ -23,7 +23,13 @@ public struct ImageRequest: Hashable, Sendable {
 
 public final class ImageStore: @unchecked Sendable {
     public static let shared: ImageStore
-    public init(name: String = "default", memoryCountLimit: Int = 150, diskByteLimit: Int = 200 * 1024 * 1024)
+    public init(name: String = "default", memoryCountLimit: Int = 150,
+                memoryByteLimit: Int = ImageStore.recommendedMemoryByteLimit(),  // scales with device RAM
+                diskByteLimit: Int = 200 * 1024 * 1024)
+
+    // A per-tier memory budget scaled to physical RAM (a fraction, clamped per platform). macOS gets a higher
+    // ceiling than iOS, where NSCache's automatic memory-pressure purge is the real safety net.
+    public static func recommendedMemoryByteLimit() -> Int
 
     // Synchronous, thread-safe reads (fast; safe to call during layout):
     public func cachedImage(for request: ImageRequest) -> PlatformImage?            // ready-to-draw variant, nil on miss
@@ -61,7 +67,10 @@ ImageStore.shared.load(ImageRequest(url: url, targetWidth: 840, cornerRadius: 10
 
 - Two-tier cache:
   - In memory: an `NSCache` of ready-to-draw variants (keyed by the full `ImageRequest`) + an `NSCache` of
-    originals (raw bytes + natural pixel size).
+    originals (raw bytes + natural pixel size). Each tier is bounded by BOTH a count limit and a byte
+    (`totalCostLimit`) budget: variant cost is the DECODED bitmap size (`width*height*4`), original cost is the
+    compressed transport size. So a handful of large photos evict on wired-RAM pressure, not just on count -
+    `memoryByteLimit` caps each tier (default 100 MB).
   - On disk: the ORIGINAL transport bytes under `<Caches>/AsyncImageCache/<name>/`, filenames = `SHA256(url)`,
     with a soft byte budget enforced by an LRU-ish trim (oldest-by-mtime). Survives relaunch; the OS may
     still evict Caches (a miss just falls through to the network).
