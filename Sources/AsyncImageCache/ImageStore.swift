@@ -24,14 +24,16 @@ import UIKit
 import AppKit
 #endif
 
-/// The in-memory record of an original: the raw transport bytes (memory tier for the byte resolve) and the
-/// natural pixel size. Immutable, so it is safely `Sendable` inside an NSCache.
+/// The in-memory record of an original: the raw transport bytes (memory tier for the byte resolve), the
+/// natural pixel size, and the placeholder grid. Immutable, so it is safely `Sendable` in NSCache.
 private final class OriginalRecord: Sendable {
     let rawData: Data
     let pixelSize: CGSize
-    init(rawData: Data, pixelSize: CGSize) {
+    let placeholder: ImagePlaceholder?
+    init(rawData: Data, pixelSize: CGSize, placeholder: ImagePlaceholder?) {
         self.rawData = rawData
         self.pixelSize = pixelSize
+        self.placeholder = placeholder
     }
 }
 
@@ -43,6 +45,14 @@ private final class SizeBox: Sendable {
     }
 }
 
+/// A boxed ImagePlaceholder for the xattr-sourced placeholder memo (NSCache values must be classes).
+private final class PlaceholderBox: Sendable {
+    let placeholder: ImagePlaceholder
+    init(_ placeholder: ImagePlaceholder) {
+        self.placeholder = placeholder
+    }
+}
+
 public final class ImageStore: @unchecked Sendable {
 
     public static let shared = ImageStore()
@@ -50,6 +60,7 @@ public final class ImageStore: @unchecked Sendable {
     private let variantCache = NSCache<NSString, PlatformImage>()
     private let originalCache = NSCache<NSString, OriginalRecord>()
     private let pixelSizeMemo = NSCache<NSString, SizeBox>()   // sizes read from the disk xattr, memoized
+    private let placeholderMemo = NSCache<NSString, PlaceholderBox>()   // placeholder grids from the xattr
     private let diskCache: DiskCache
     private let workQueue: DispatchQueue
 
@@ -89,6 +100,25 @@ public final class ImageStore: @unchecked Sendable {
         if let size = diskCache.pixelSize(for: url) {
             pixelSizeMemo.setObject(SizeBox(size), forKey: key)
             return size
+        }
+        return nil
+    }
+
+    /// The placeholder grid for a URL's image, if known WITHOUT decoding - a soft preview to fill the reserved
+    /// box while the pixels load, instead of flat gray. Thread-safe, and (like the size) survives relaunch via
+    /// the on-disk xattr. Returns nil when no placeholder was stored (the caller then uses a neutral fallback);
+    /// there is no decode fallback, since the grid needs the actual pixels.
+    public func placeholder(for url: URL) -> ImagePlaceholder? {
+        let key = url.absoluteString as NSString
+        if let record = originalCache.object(forKey: key) {
+            return record.placeholder
+        }
+        if let memo = placeholderMemo.object(forKey: key) {
+            return memo.placeholder
+        }
+        if let placeholder = diskCache.placeholder(for: url) {
+            placeholderMemo.setObject(PlaceholderBox(placeholder), forKey: key)
+            return placeholder
         }
         return nil
     }
@@ -135,6 +165,7 @@ public final class ImageStore: @unchecked Sendable {
         variantCache.removeAllObjects()
         originalCache.removeAllObjects()
         pixelSizeMemo.removeAllObjects()
+        placeholderMemo.removeAllObjects()
     }
 
     public func removeAll() {
@@ -188,9 +219,11 @@ public final class ImageStore: @unchecked Sendable {
     // ORIGINAL transport bytes to disk. No transcoding here - that is a consumer concern.
     private func recordOriginal(url: URL, data: Data, decoded: PlatformImage, writeDisk: Bool) {
         let pixelSize = ImageProcessing.pixelSize(of: decoded)
-        originalCache.setObject(OriginalRecord(rawData: data, pixelSize: pixelSize), forKey: url.absoluteString as NSString)
+        let placeholder = ImageProcessing.placeholder(of: decoded)
+        originalCache.setObject(OriginalRecord(rawData: data, pixelSize: pixelSize, placeholder: placeholder),
+                                forKey: url.absoluteString as NSString)
         if writeDisk {
-            diskCache.store(data, pixelSize: pixelSize, for: url)
+            diskCache.store(data, pixelSize: pixelSize, placeholder: placeholder, for: url)
         }
     }
 

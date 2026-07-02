@@ -72,13 +72,29 @@ public struct CachedImage: View {
                         .resizable()
                         .aspectRatio(contentMode: contentMode)
                 } else {
-                    Rectangle().fill(Color.gray.opacity(0.12))
+                    placeholder
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .task(id: url) {
                 await load()
             }
+    }
+
+    // While loading, fill the reserved box with the image's placeholder grid - a cheap sync read that survives
+    // relaunch via the on-disk xattr - upscaled with interpolation into a soft gradient preview of the image,
+    // instead of flat gray. Fall back to neutral gray when no placeholder is known (not loaded yet).
+    @ViewBuilder
+    private var placeholder: some View {
+        if let url, let grid = store.placeholder(for: url), let image = ImageProcessing.gridImage(from: grid) {
+            // Stretch the NxN grid to fill the box: it was sampled by squishing the whole image into NxN, so
+            // stretching back to the box's aspect reconstitutes the proportions. Bilinear = soft gradient.
+            imageView(image)
+                .resizable()
+                .interpolation(.high)
+        } else {
+            Rectangle().fill(Color.gray.opacity(0.12))
+        }
     }
 
     private func imageView(_ image: PlatformImage) -> Image {

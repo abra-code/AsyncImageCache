@@ -25,6 +25,62 @@ enum ImageProcessing {
         #endif
     }
 
+    /// The image's placeholder grid: an N x N (N = ImagePlaceholderConfig.gridDimension) set of average colors
+    /// in sRGB. Draws the image into an N x N context (CoreGraphics area-averages as it downsamples) and reads
+    /// the cells back, row 0 = TOP (a CGBitmapContext stores memory row 0 as the top of the drawn image). The
+    /// bitmap is premultiplied, so each cell is un-premultiplied by alpha to recover the true tint (alpha kept,
+    /// so transparent images give a translucent placeholder). Off-main; nil if there is no CGImage / context.
+    static func placeholder(of image: PlatformImage) -> ImagePlaceholder? {
+        guard let cg = cgImage(from: image) else {
+            return nil
+        }
+        let n = ImagePlaceholderConfig.gridDimension
+        var buf = [UInt8](repeating: 0, count: n * n * 4)
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let drawn = buf.withUnsafeMutableBytes { raw -> Bool in
+            guard let base = raw.baseAddress,
+                  let ctx = CGContext(data: base, width: n, height: n, bitsPerComponent: 8, bytesPerRow: n * 4,
+                                      space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                return false
+            }
+            ctx.interpolationQuality = .medium
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: n, height: n))
+            return true
+        }
+        guard drawn else {
+            return nil
+        }
+        var cells: [ImageColor] = []
+        cells.reserveCapacity(n * n)
+        for i in 0..<(n * n) {
+            let alpha = buf[i * 4 + 3]
+            func un(_ channel: UInt8) -> UInt8 { alpha == 0 ? 0 : UInt8(min(255, Int(channel) * 255 / Int(alpha))) }
+            cells.append(ImageColor(red: un(buf[i * 4]), green: un(buf[i * 4 + 1]), blue: un(buf[i * 4 + 2]), alpha: alpha))
+        }
+        return ImagePlaceholder(dimension: n, cells: cells)
+    }
+
+    /// An N x N platform image built from a placeholder grid, for upscaling with interpolation into a soft
+    /// gradient at display time. nil if the grid is malformed.
+    static func gridImage(from placeholder: ImagePlaceholder) -> PlatformImage? {
+        let n = placeholder.dimension
+        guard n > 0, placeholder.cells.count == n * n else {
+            return nil
+        }
+        var buf = [UInt8](repeating: 0, count: n * n * 4)
+        for (i, c) in placeholder.cells.enumerated() {
+            buf[i * 4] = c.red; buf[i * 4 + 1] = c.green; buf[i * 4 + 2] = c.blue; buf[i * 4 + 3] = c.alpha
+        }
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let provider = CGDataProvider(data: Data(buf) as CFData),
+              let cg = CGImage(width: n, height: n, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: n * 4,
+                               space: space, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) else {
+            return nil
+        }
+        return platformImage(from: cg, size: CGSize(width: n, height: n))
+    }
+
     /// Natural size in PIXELS, read from the image's own metadata rather than by forcing a CGImage. For
     /// UIImage that is size * scale (UIImage.cgImage is cheap for bitmap-backed images but nil for
     /// CIImage/symbol-backed, so this is both cheaper and more robust). For NSImage it is the largest

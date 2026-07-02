@@ -216,7 +216,7 @@ final class AsyncImageCacheTests: XCTestCase {
         let url = URL(string: "https://example.test/no-xattr.jpg")!
 
         // Store real JPEG bytes but with a .zero size, so NO xattr is written (writePixelSize guards size > 0).
-        disk.store(gradientJPEG(width: 200, height: 150), pixelSize: .zero, for: url)
+        disk.store(gradientJPEG(width: 200, height: 150), pixelSize: .zero, placeholder: nil, for: url)
 
         XCTAssertEqual(disk.pixelSize(for: url), CGSize(width: 200, height: 150),
                        "size must fall back to the image header when the xattr is absent")
@@ -224,6 +224,116 @@ final class AsyncImageCacheTests: XCTestCase {
         // ...and the fallback should have repaired the attribute, so the next read takes the fast path.
         let length = getxattr(disk.fileURL(for: url).path, "public.asyncimagecache.pixelsize", nil, 0, 0, 0)
         XCTAssertGreaterThan(length, 0, "the header fallback should write the xattr back (repair)")
+    }
+
+    // MARK: - Placeholder grid
+
+    private func samplePlaceholder(dimension n: Int = 6) -> ImagePlaceholder {
+        ImagePlaceholder(dimension: n, cells: (0..<(n * n)).map {
+            ImageColor(red: UInt8($0 % 256), green: 100, blue: 150, alpha: 255)
+        })
+    }
+
+    // Top half `top`, bottom half `bottom`, built from a raw top-down buffer so orientation is unambiguous.
+    private func topBottomImage(top: (UInt8, UInt8, UInt8), bottom: (UInt8, UInt8, UInt8), size: Int = 24) -> PlatformImage {
+        var buf = [UInt8](repeating: 0, count: size * size * 4)
+        for row in 0..<size {
+            for col in 0..<size {
+                let i = (row * size + col) * 4
+                let c = row < size / 2 ? top : bottom
+                buf[i] = c.0; buf[i + 1] = c.1; buf[i + 2] = c.2; buf[i + 3] = 255
+            }
+        }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let prov = CGDataProvider(data: Data(buf) as CFData)!
+        let cg = CGImage(width: size, height: size, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: size * 4,
+                         space: space, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                         provider: prov, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        #if canImport(UIKit)
+        return UIImage(cgImage: cg)
+        #else
+        return NSImage(cgImage: cg, size: CGSize(width: size, height: size))
+        #endif
+    }
+
+    func testPlaceholderGridOfSolidImage() throws {
+        // makeImage fills a solid sRGB (0.2, 0.4, 0.8) ~ (51, 102, 204).
+        let p = try XCTUnwrap(ImageProcessing.placeholder(of: makeImage(width: 48, height: 48, opaque: true)))
+        XCTAssertEqual(p.dimension, 6)
+        XCTAssertEqual(p.cells.count, 36)
+        let c = p.dominantColor
+        XCTAssert(abs(Int(c.red) - 51) <= 8, "red \(c.red)")
+        XCTAssert(abs(Int(c.green) - 102) <= 8, "green \(c.green)")
+        XCTAssert(abs(Int(c.blue) - 204) <= 8, "blue \(c.blue)")
+        XCTAssertEqual(c.alpha, 255)
+    }
+
+    func testPlaceholderGridIsTopDown() throws {
+        let p = try XCTUnwrap(ImageProcessing.placeholder(of: topBottomImage(top: (220, 20, 20), bottom: (20, 20, 220))))
+        let n = p.dimension
+        XCTAssertGreaterThan(p.cells[0].red, p.cells[0].blue, "top-left should be red-dominant, not flipped")
+        XCTAssertGreaterThan(p.cells[(n - 1) * n].blue, p.cells[(n - 1) * n].red, "bottom-left should be blue-dominant")
+    }
+
+    func testDiskCacheStoresAndReadsPlaceholderGrid() {
+        let disk = DiskCache(name: uniqueName(), byteLimit: 10 * 1024 * 1024)
+        defer { disk.removeAll() }
+        let url = URL(string: "https://example.test/p.png")!
+        let grid = samplePlaceholder()
+        disk.store(pngData(width: 4, height: 4), pixelSize: CGSize(width: 4, height: 4), placeholder: grid, for: url)
+        XCTAssertEqual(disk.placeholder(for: url), grid)
+    }
+
+    func testDiskCachePlaceholderIsNilWhenNotWritten() {
+        let disk = DiskCache(name: uniqueName(), byteLimit: 10 * 1024 * 1024)
+        defer { disk.removeAll() }
+        let url = URL(string: "https://example.test/p2.png")!
+        disk.store(pngData(width: 4, height: 4), pixelSize: CGSize(width: 4, height: 4), placeholder: nil, for: url)
+        XCTAssertNil(disk.placeholder(for: url))
+    }
+
+    // Security / robustness: a placeholder xattr whose length does not describe a valid N x N grid must be
+    // REJECTED, not misread.
+    func testDiskCacheRejectsWrongSizePlaceholderXattr() {
+        let disk = DiskCache(name: uniqueName(), byteLimit: 10 * 1024 * 1024)
+        defer { disk.removeAll() }
+        let url = URL(string: "https://example.test/bad.png")!
+        disk.store(pngData(width: 4, height: 4), pixelSize: CGSize(width: 4, height: 4), placeholder: samplePlaceholder(), for: url)
+        // Overwrite with 8 RGBA bytes (2 cells) — not a perfect square, so not a valid grid.
+        let garbage: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8]
+        disk.fileURL(for: url).withUnsafeFileSystemRepresentation { path in
+            guard let path else { return }
+            _ = garbage.withUnsafeBytes { setxattr(path, "public.asyncimagecache.placeholder", $0.baseAddress, $0.count, 0, XATTR_NOFOLLOW) }
+        }
+        XCTAssertNil(disk.placeholder(for: url), "a non-square placeholder xattr must be rejected")
+    }
+
+    // After "relaunch" (fresh store, empty memory) the placeholder grid is read from the xattr with no decode.
+    func testPlaceholderSurvivesRelaunchViaXattr() throws {
+        let name = uniqueName()
+        let store = ImageStore(name: name)
+        defer { store.removeAll() }
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(uniqueName()).png")
+        try pngData(width: 16, height: 16, opaque: true).write(to: temp)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let request = ImageRequest(url: temp)
+
+        let loaded = expectation(description: "load")
+        store.load(request) { _ in loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+        let afterLoad = try XCTUnwrap(store.placeholder(for: temp))
+        XCTAssertEqual(afterLoad.dimension, 6)
+
+        try FileManager.default.removeItem(at: temp)
+        let second = ImageStore(name: name)
+        defer { second.removeAll() }
+        XCTAssertEqual(second.placeholder(for: temp), afterLoad, "the grid must round-trip via the xattr, no decode")
+    }
+
+    func testPlaceholderIsNilWhenNeverLoaded() {
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        XCTAssertNil(store.placeholder(for: URL(string: "https://example.test/never.png")!))
     }
 
     // MARK: - Performance: reading dimensions
@@ -249,7 +359,7 @@ final class AsyncImageCacheTests: XCTestCase {
     private func store100(_ disk: DiskCache, bytes: Data, withXattr: Bool) -> [URL] {
         let urls = (0..<100).map { URL(string: "https://example.test/img-\($0).jpg")! }
         for (i, url) in urls.enumerated() {
-            disk.store(bytes, pixelSize: withXattr ? CGSize(width: 1024, height: 768 + i) : .zero, for: url)
+            disk.store(bytes, pixelSize: withXattr ? CGSize(width: 1024, height: 768 + i) : .zero, placeholder: nil, for: url)
         }
         return urls
     }

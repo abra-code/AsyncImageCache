@@ -41,9 +41,10 @@ final class DiskCache: @unchecked Sendable {
         try? Data(contentsOf: fileURL(for: url))
     }
 
-    /// Write the original bytes for a URL plus its pixel size (as an extended attribute ON the bytes file,
-    /// so dimensions travel with the bytes and survive relaunch), then trim if the directory is over budget.
-    func store(_ data: Data, pixelSize: CGSize, for url: URL) {
+    /// Write the original bytes for a URL plus its pixel size and (if computed) its placeholder grid as
+    /// extended attributes ON the bytes file, so both travel with the bytes and survive relaunch, then trim if
+    /// the directory is over budget.
+    func store(_ data: Data, pixelSize: CGSize, placeholder: ImagePlaceholder?, for url: URL) {
         writeLock.lock()
         defer {
             writeLock.unlock()
@@ -51,7 +52,18 @@ final class DiskCache: @unchecked Sendable {
         let file = fileURL(for: url)
         try? data.write(to: file, options: .atomic)
         writePixelSize(pixelSize, at: file)
+        if let placeholder {
+            writePlaceholder(placeholder, at: file)
+        }
         trimIfNeeded()
+    }
+
+    /// The placeholder grid stored for a URL, or nil if absent or invalid. A cheap getxattr, NO decode - and
+    /// unlike pixel size there is no header fallback (a grid needs the actual pixels, not worth a decode just
+    /// for a placeholder); an absent/invalid value simply means the caller falls back to a neutral placeholder
+    /// and the next real load computes + stores it.
+    func placeholder(for url: URL) -> ImagePlaceholder? {
+        return readPlaceholder(at: fileURL(for: url))
     }
 
     /// The natural pixel size of a cached image WITHOUT decoding it. First path (the common one): a cheap
@@ -159,6 +171,59 @@ final class DiskCache: @unchecked Sendable {
                 return nil
             }
             return CGSize(width: Int(record.width), height: Int(record.height))
+        }
+    }
+
+    // The placeholder grid persists as N*N RGBA cells. The dimension N is derived from the payload length
+    // (length / 4 must be a perfect square) and must equal ImagePlaceholderConfig.gridDimension. A single
+    // getxattr into a fixed max-size buffer; discard if the returned length does not describe that grid.
+    private static let placeholderAttrName = "public.asyncimagecache.placeholder"
+
+    private func writePlaceholder(_ placeholder: ImagePlaceholder, at file: URL) {
+        let n = placeholder.dimension
+        guard n > 0, n <= ImagePlaceholderConfig.maxGridDimension, placeholder.cells.count == n * n else {
+            return
+        }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(n * n * 4)
+        for c in placeholder.cells {
+            bytes.append(c.red); bytes.append(c.green); bytes.append(c.blue); bytes.append(c.alpha)
+        }
+        file.withUnsafeFileSystemRepresentation { path in
+            guard let path else {
+                return
+            }
+            bytes.withUnsafeBytes { raw in
+                _ = setxattr(path, DiskCache.placeholderAttrName, raw.baseAddress, raw.count, 0, XATTR_NOFOLLOW)
+            }
+        }
+    }
+
+    private func readPlaceholder(at file: URL) -> ImagePlaceholder? {
+        return file.withUnsafeFileSystemRepresentation { path -> ImagePlaceholder? in
+            guard let path else {
+                return nil
+            }
+            let maxBytes = ImagePlaceholderConfig.maxPayloadBytes
+            var buf = [UInt8](repeating: 0, count: maxBytes)
+            let read = buf.withUnsafeMutableBytes { raw in
+                getxattr(path, DiskCache.placeholderAttrName, raw.baseAddress, maxBytes, 0, XATTR_NOFOLLOW)
+            }
+            guard read > 0, read <= maxBytes, read % 4 == 0 else {
+                return nil
+            }
+            let cellCount = read / 4
+            let n = Int(sqrt(Double(cellCount)))
+            guard n == ImagePlaceholderConfig.gridDimension, n * n == cellCount else {
+                return nil
+            }
+            var cells: [ImageColor] = []
+            cells.reserveCapacity(cellCount)
+            for i in 0..<cellCount {
+                let o = i * 4
+                cells.append(ImageColor(red: buf[o], green: buf[o + 1], blue: buf[o + 2], alpha: buf[o + 3]))
+            }
+            return ImagePlaceholder(dimension: n, cells: cells)
         }
     }
 
