@@ -66,6 +66,28 @@ final class DiskCache: @unchecked Sendable {
         return readPlaceholder(at: fileURL(for: url))
     }
 
+    /// Write the placeholder xattr onto an already-cached bytes file when it is absent. Files cached by a
+    /// build that predates the placeholder (or whose attribute was stripped) never pass through store() again
+    /// - the disk-hit load path calls this after computing the grid, so the attribute self-repairs. A cheap
+    /// size-only getxattr probe when the attribute is already there.
+    func storePlaceholderIfMissing(_ placeholder: ImagePlaceholder, for url: URL) {
+        let file = fileURL(for: url)
+        let present = file.withUnsafeFileSystemRepresentation { path -> Bool in
+            guard let path else {
+                return true
+            }
+            return getxattr(path, DiskCache.placeholderAttrName, nil, 0, 0, XATTR_NOFOLLOW) >= 0
+        }
+        guard !present else {
+            return
+        }
+        writeLock.lock()
+        defer {
+            writeLock.unlock()
+        }
+        writePlaceholder(placeholder, at: file)
+    }
+
     /// The natural pixel size of a cached image WITHOUT decoding it. First path (the common one): a cheap
     /// getxattr of the 8-byte size attribute. Fallback: if the attribute is missing but the bytes are on disk
     /// (the xattr was lost, or the bytes were cached by an older build) read the size from the image HEADER via
@@ -92,6 +114,11 @@ final class DiskCache: @unchecked Sendable {
               let height = props[kCGImagePropertyPixelHeight] as? Int,
               width > 0, height > 0 else {
             return nil
+        }
+        // Header width/height are pre-rotation; EXIF orientations 5-8 render with the axes swapped, so swap
+        // here too - the size must describe the image AS DISPLAYED, matching what the decode path stores.
+        if let orientation = props[kCGImagePropertyOrientation] as? UInt32, (5...8).contains(orientation) {
+            return CGSize(width: height, height: width)
         }
         return CGSize(width: width, height: height)
     }

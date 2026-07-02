@@ -25,6 +25,26 @@ enum ImageProcessing {
         #endif
     }
 
+    /// The image with its EXIF orientation baked into the pixels. UIImage keeps the UNROTATED bitmap in
+    /// `cgImage` and applies `imageOrientation` only at draw time - so the variant/placeholder pipelines,
+    /// which draw the CGImage directly, would render phone photos sideways (and disagree with `pixelSize`,
+    /// which IS orientation-corrected). Redraws only when not already `.up`; NSImage applies EXIF orientation
+    /// at decode, so macOS returns the image untouched. Off-main safe (UIGraphicsImageRenderer is thread-safe).
+    static func orientedUp(_ image: PlatformImage) -> PlatformImage {
+        #if canImport(UIKit)
+        guard image.imageOrientation != .up else {
+            return image
+        }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = image.scale
+        return UIGraphicsImageRenderer(size: image.size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: image.size))
+        }
+        #else
+        return image
+        #endif
+    }
+
     /// The image's placeholder grid: an N x N (N = ImagePlaceholderConfig.gridDimension) set of average colors
     /// in sRGB. Draws the image into an N x N context (CoreGraphics area-averages as it downsamples) and reads
     /// the cells back, row 0 = TOP (a CGBitmapContext stores memory row 0 as the top of the drawn image). The
@@ -72,9 +92,12 @@ enum ImageProcessing {
             buf[i * 4] = c.red; buf[i * 4 + 1] = c.green; buf[i * 4 + 2] = c.blue; buf[i * 4 + 3] = c.alpha
         }
         let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        // The cells hold UN-premultiplied rgba (placeholder(of:) un-premultiplies on capture), so the image
+        // must be tagged .last, not premultiplied - otherwise semi-transparent placeholders composite too
+        // bright (the color channels get counted at full strength AND the backdrop shows through).
         guard let provider = CGDataProvider(data: Data(buf) as CFData),
               let cg = CGImage(width: n, height: n, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: n * 4,
-                               space: space, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                               space: space, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
                                provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent) else {
             return nil
         }
@@ -101,24 +124,54 @@ enum ImageProcessing {
         #endif
     }
 
-    /// Wrap a CGImage back into a platform image at 1x (so `.size` in points == pixel dimensions).
+    /// The resident RAM footprint of a decoded image in bytes - its DECODED bitmap, not its compressed
+    /// transport size. Used as the NSCache cost so the variant cache is bounded by wired memory rather than a
+    /// bare object count (a single 12 MP photo decodes to ~48 MB regardless of how well its JPEG compressed).
+    /// `bytesPerRow * height` is the exact allocation (it accounts for row padding); the size*4 branch is a
+    /// floor for the rare image with no CGImage.
+    static func memoryCost(of image: PlatformImage) -> Int {
+        if let cg = cgImage(from: image) {
+            return max(1, cg.bytesPerRow * cg.height)
+        }
+        let size = pixelSize(of: image)
+        return max(1, Int(size.width) * Int(size.height) * 4)
+    }
+
+    /// Wrap a CGImage back into a platform image at 1x (so `.size` in points == pixel dimensions). On macOS
+    /// this goes through NSBitmapImageRep(cgImage:), NOT NSImage(cgImage:size:): the latter reports its pixel
+    /// dimensions as size * the display's backing scale, so `pixelsWide` (and therefore pixelSize / memoryCost)
+    /// reads 2x on a Retina screen. A bitmap rep carries the exact pixel dimensions, so downstream size and
+    /// cost accounting stay accurate and machine-independent.
     static func platformImage(from cg: CGImage, size: CGSize) -> PlatformImage {
         #if canImport(UIKit)
         return UIImage(cgImage: cg)
         #else
-        return NSImage(cgImage: cg, size: size)
+        let rep = NSBitmapImageRep(cgImage: cg)
+        rep.size = size
+        let image = NSImage(size: size)
+        image.addRepresentation(rep)
+        return image
         #endif
     }
 
-    /// Produce the ready-to-draw variant: downscale so width <= `targetWidth` (points) when the image is
-    /// wider, then apply a rounded-corner mask when `cornerRadius > 0`. Returns the original image untouched
-    /// when neither transform applies. Everything here is CoreGraphics and safe off the main thread.
+    /// Produce the ready-to-draw variant: downscale so width <= `targetWidth` (pixels) when the image is
+    /// wider, apply a rounded-corner mask when `cornerRadius > 0`, and ALWAYS redraw into a fresh bitmap even
+    /// when neither transform applies - PlatformImage(data:) defers the actual transport-format decompression
+    /// to first draw, which would otherwise land on the MAIN thread at render time; drawing here forces the
+    /// decode on the work queue, which is the library's core promise. Returns the original image only when
+    /// there is no CGImage to draw or no context can be made. Safe off the main thread.
     static func variant(from image: PlatformImage, targetWidth: CGFloat?, cornerRadius: CGFloat) -> PlatformImage {
         guard let cg = cgImage(from: image) else {
             return image
         }
-        let naturalWidth = CGFloat(cg.width)
-        let naturalHeight = CGFloat(cg.height)
+        // Base the geometry on the TRUE natural pixel size, NOT cg.width: on macOS cgImage(forProposedRect:)
+        // can rasterize an NSImage at the display's backing scale, so cg.width is 2x the real size on a Retina
+        // screen. pixelSize reads the native dimensions (representations / UIImage.scale); cg is only the
+        // content, and ctx.draw scales it into the target rect. This also keeps output sizes deterministic
+        // across machines (a headless 1x runner vs a 2x display).
+        let natural = pixelSize(of: image)
+        let naturalWidth = natural.width
+        let naturalHeight = natural.height
         guard naturalWidth > 0, naturalHeight > 0 else {
             return image
         }
@@ -131,20 +184,21 @@ enum ImageProcessing {
             height = (naturalHeight * scale).rounded()
         }
 
-        let unchanged = width == naturalWidth && height == naturalHeight
-        if unchanged && cornerRadius <= 0 {
-            return image
-        }
-
         let pixelWidth = Int(width)
         let pixelHeight = Int(height)
         guard pixelWidth > 0, pixelHeight > 0 else {
             return image
         }
-        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        // Keep an RGB-model source space (e.g. Display P3) so wide-gamut images are not clamped to sRGB;
+        // other models (indexed, CMYK, grayscale) draw into sRGB, and if the source space cannot back a
+        // bitmap context, sRGB is the fallback.
+        let sRGB = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let space = (cg.colorSpace?.model == .rgb ? cg.colorSpace : nil) ?? sRGB
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
         guard let ctx = CGContext(data: nil, width: pixelWidth, height: pixelHeight, bitsPerComponent: 8,
-                                  bytesPerRow: 0, space: space,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                                  bytesPerRow: 0, space: space, bitmapInfo: bitmapInfo)
+            ?? CGContext(data: nil, width: pixelWidth, height: pixelHeight, bitsPerComponent: 8,
+                         bytesPerRow: 0, space: sRGB, bitmapInfo: bitmapInfo) else {
             return image
         }
         ctx.interpolationQuality = .high

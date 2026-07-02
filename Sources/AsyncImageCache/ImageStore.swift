@@ -69,13 +69,47 @@ public final class ImageStore: @unchecked Sendable {
     private let lock = NSLock()
     private var inFlight: [ImageRequest: [(PlatformImage?) -> Void]] = [:]
 
+    /// - Parameters:
+    ///   - name: names the on-disk subdirectory and work queue; distinct names are fully independent caches.
+    ///   - memoryCountLimit: max number of entries in EACH in-memory tier (variants, originals).
+    ///   - memoryByteLimit: soft ceiling on the RAM held by EACH in-memory tier, enforced by NSCache cost. The
+    ///     dominant consumer is the variant cache, whose entries are DECODED bitmaps (a 12 MP image is ~48 MB
+    ///     resident however well it compressed) - so this bounds wired memory in a way a bare count cannot.
+    ///     Both a count and a cost limit are active; NSCache evicts (approximately, LRU-ish) when either is
+    ///     exceeded, and ALSO purges automatically under system memory pressure - so this is an upper bound,
+    ///     not a reservation. Defaults to `recommendedMemoryByteLimit()`, which scales with device RAM. Set it
+    ///     comfortably above the largest single decoded image you expect, or that image cannot stay resident.
+    ///   - diskByteLimit: soft byte budget for the on-disk original bytes.
     public init(name: String = "default",
                 memoryCountLimit: Int = 150,
+                memoryByteLimit: Int = ImageStore.recommendedMemoryByteLimit(),
                 diskByteLimit: Int = 200 * 1024 * 1024) {
         variantCache.countLimit = memoryCountLimit
         originalCache.countLimit = memoryCountLimit
+        variantCache.totalCostLimit = max(0, memoryByteLimit)
+        originalCache.totalCostLimit = max(0, memoryByteLimit)
         diskCache = DiskCache(name: name, byteLimit: diskByteLimit)
         workQueue = DispatchQueue(label: "com.richtextview.AsyncImageCache.\(name)", attributes: .concurrent)
+    }
+
+    /// A per-tier memory budget scaled to the device's physical RAM. A fixed default is wrong at both ends:
+    /// too low starves a modern 8 GB iPhone or a 64 GB Mac; too high risks a jetsam kill on an older iOS
+    /// device (which enforces a per-app limit far below total RAM) or in an app extension (a share/notification
+    /// extension gets only tens of MB). So: a fraction of `physicalMemory`, clamped to a platform floor and
+    /// ceiling. macOS gets a higher ceiling (no jetsam, and desktops routinely have 16-128 GB); iOS stays
+    /// conservative because NSCache's automatic memory-pressure purge is the real safety net, not this number.
+    /// This is `public` and cheap (one `ProcessInfo` read) so callers can reuse or scale it explicitly.
+    public static func recommendedMemoryByteLimit() -> Int {
+        let physical = ProcessInfo.processInfo.physicalMemory   // total device RAM, in bytes
+        let fraction = Int(physical / 16)
+        #if os(macOS)
+        let floorBytes = 256 * 1024 * 1024
+        let ceilingBytes = 1024 * 1024 * 1024
+        #else
+        let floorBytes = 64 * 1024 * 1024
+        let ceilingBytes = 320 * 1024 * 1024
+        #endif
+        return min(max(fraction, floorBytes), ceilingBytes)
     }
 
     // MARK: - Synchronous lookups
@@ -153,11 +187,7 @@ public final class ImageStore: @unchecked Sendable {
         lock.unlock()
 
         workQueue.async { [self] in
-            let image = produce(request)
-            lock.lock()
-            let pending = inFlight.removeValue(forKey: request) ?? []
-            lock.unlock()
-            deliver(image, to: pending)
+            startProduction(request)
         }
     }
 
@@ -183,36 +213,53 @@ public final class ImageStore: @unchecked Sendable {
         diskCache.fileExists(for: url)
     }
 
+    var variantByteLimit: Int { variantCache.totalCostLimit }
+    var originalByteLimit: Int { originalCache.totalCostLimit }
+
     // MARK: - Off-main pipeline
 
-    // Resolve original bytes (memory -> disk -> source), decode, record the original + write disk, then build
-    // and cache the ready-to-draw variant. Runs entirely on the work queue.
-    private func produce(_ request: ImageRequest) -> PlatformImage? {
+    // Resolve original bytes (memory -> disk -> source) and hand them to finishProduction. Local schemes
+    // (data:/file:) resolve inline on the work queue; http(s) hands off to URLSession and continues on the
+    // work queue from its callback, so no work-queue thread ever blocks waiting on the network - blocking one
+    // GCD thread per in-flight download (a semaphore wait) can exhaust the GCD thread pool during image-heavy
+    // scrolling and starve the rest of the app's queues.
+    private func startProduction(_ request: ImageRequest) {
         let url = request.url
-        let bytes: Data
-        var writeDisk = false
-
         if let record = originalCache.object(forKey: url.absoluteString as NSString) {
-            bytes = record.rawData
+            finishProduction(request, bytes: record.rawData, writeDisk: false)
         } else if let disk = diskCache.data(for: url) {
-            bytes = disk
-        } else if let fresh = fetchFromSource(url) {
-            bytes = fresh
-            writeDisk = true
+            finishProduction(request, bytes: disk, writeDisk: false)
+        } else if let scheme = url.scheme?.lowercased(), scheme == "data" || scheme == "file" {
+            finishProduction(request, bytes: try? Data(contentsOf: url), writeDisk: true)
         } else {
-            return nil
+            let task = Self.urlSession.dataTask(with: url) { [self] data, response, _ in
+                let bytes = Self.acceptableBody(data, response)
+                workQueue.async { [self] in
+                    finishProduction(request, bytes: bytes, writeDisk: true)
+                }
+            }
+            task.resume()
         }
+    }
 
-        guard let decoded = PlatformImage(data: bytes) else {
-            return nil
+    // Decode, record the original (+ disk write for fresh bytes), build + cache the ready-to-draw variant,
+    // then fire the pending completions. Runs on the work queue; nil bytes (fetch failed) delivers nil.
+    private func finishProduction(_ request: ImageRequest, bytes: Data?, writeDisk: Bool) {
+        var variant: PlatformImage?
+        if let bytes, let raw = PlatformImage(data: bytes) {
+            let decoded = ImageProcessing.orientedUp(raw)
+            recordOriginal(url: request.url, data: bytes, decoded: decoded, writeDisk: writeDisk)
+            let built = ImageProcessing.variant(from: decoded,
+                                                targetWidth: request.quantizedTargetWidth.map { CGFloat($0) },
+                                                cornerRadius: CGFloat(request.quantizedCornerRadius))
+            variantCache.setObject(built, forKey: request.variantKey as NSString,
+                                   cost: ImageProcessing.memoryCost(of: built))
+            variant = built
         }
-        recordOriginal(url: url, data: bytes, decoded: decoded, writeDisk: writeDisk)
-
-        let variant = ImageProcessing.variant(from: decoded,
-                                               targetWidth: request.quantizedTargetWidth.map { CGFloat($0) },
-                                               cornerRadius: CGFloat(request.quantizedCornerRadius))
-        variantCache.setObject(variant, forKey: request.variantKey as NSString)
-        return variant
+        lock.lock()
+        let pending = inFlight.removeValue(forKey: request) ?? []
+        lock.unlock()
+        deliver(variant, to: pending)
     }
 
     // Record the raw bytes + natural pixel size in memory and (for freshly fetched bytes) persist the
@@ -220,38 +267,36 @@ public final class ImageStore: @unchecked Sendable {
     private func recordOriginal(url: URL, data: Data, decoded: PlatformImage, writeDisk: Bool) {
         let pixelSize = ImageProcessing.pixelSize(of: decoded)
         let placeholder = ImageProcessing.placeholder(of: decoded)
+        // Cost = the transport bytes held resident (the compressed original); the size + grid are negligible.
         originalCache.setObject(OriginalRecord(rawData: data, pixelSize: pixelSize, placeholder: placeholder),
-                                forKey: url.absoluteString as NSString)
+                                forKey: url.absoluteString as NSString, cost: max(1, data.count))
         if writeDisk {
             diskCache.store(data, pixelSize: pixelSize, placeholder: placeholder, for: url)
+        } else if let placeholder {
+            // Bytes came from the cache: files written by a build that predates the placeholder (or whose
+            // attribute was stripped) never pass through store() again, so repair the xattr here.
+            diskCache.storePlaceholderIfMissing(placeholder, for: url)
         }
     }
 
-    // Byte fetch from the source of last resort. data: / file: read without the network; http(s) go through
-    // URLSession synchronously (this runs on the work queue, so blocking here is fine).
-    private func fetchFromSource(_ url: URL) -> Data? {
-        switch url.scheme {
-        case "data", "file":
-            return try? Data(contentsOf: url)
-        default:
-            return synchronousData(from: url)
+    // The response body worth caching, or nil to reject it. A non-2xx HTTP status is rejected so an error
+    // page - some CDNs serve a placeholder image or an HTML error with a 404/500 - is never decoded into a
+    // "successful" variant or persisted to disk (which would then be served forever). A non-HTTP response
+    // (uncommon on this branch, which only handles remote schemes) is accepted as-is.
+    static func acceptableBody(_ data: Data?, _ response: URLResponse?) -> Data? {
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            return nil
         }
+        return data
     }
 
-    private func synchronousData(from url: URL) -> Data? {
-        final class ResultBox: @unchecked Sendable {
-            var data: Data?
-        }
-        let box = ResultBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        let task = URLSession.shared.dataTask(with: url) { data, _, _ in
-            box.data = data
-            semaphore.signal()
-        }
-        task.resume()
-        semaphore.wait()
-        return box.data
-    }
+    // Downloads bypass the shared URLCache: DiskCache already persists the fetched bytes, and the default
+    // shared cache would store a second copy of every image on disk.
+    private static let urlSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }()
 
     // The ONLY main-thread work: fire the pending completions. The image + completions are non-Sendable
     // (NSImage, caller closures), so they cross the hop inside an UncheckedSendableBox.

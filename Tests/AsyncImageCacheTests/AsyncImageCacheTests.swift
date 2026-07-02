@@ -226,6 +226,27 @@ final class AsyncImageCacheTests: XCTestCase {
         XCTAssertGreaterThan(length, 0, "the header fallback should write the xattr back (repair)")
     }
 
+    // The header fallback must report the size AS DISPLAYED: EXIF orientations 5-8 rotate by 90 degrees, so
+    // the raw header width/height are swapped relative to what the decode path stores.
+    func testHeaderFallbackSwapsExifRotatedDimensions() throws {
+        let disk = DiskCache(name: uniqueName(), byteLimit: 10 * 1024 * 1024)
+        defer { disk.removeAll() }
+        let url = URL(string: "https://example.test/rotated.jpg")!
+
+        // A 100x40 JPEG tagged EXIF orientation 6 (90 degrees CW): displayed size is 40x100.
+        let plain = gradientJPEG(width: 100, height: 40)
+        let src = try XCTUnwrap(CGImageSourceCreateWithData(plain as CFData, nil))
+        let out = NSMutableData()
+        let dest = try XCTUnwrap(CGImageDestinationCreateWithData(out, CGImageSourceGetType(src)!, 1, nil))
+        CGImageDestinationAddImageFromSource(dest, src, 0, [kCGImagePropertyOrientation: 6] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+
+        // .zero pixelSize -> no xattr written, so pixelSize(for:) must take the header fallback.
+        disk.store(out as Data, pixelSize: .zero, placeholder: nil, for: url)
+        XCTAssertEqual(disk.pixelSize(for: url), CGSize(width: 40, height: 100),
+                       "EXIF 5-8 images must report axes swapped (the size as displayed)")
+    }
+
     // MARK: - Placeholder grid
 
     private func samplePlaceholder(dimension n: Int = 6) -> ImagePlaceholder {
@@ -334,6 +355,150 @@ final class AsyncImageCacheTests: XCTestCase {
         let store = ImageStore(name: uniqueName())
         defer { store.removeAll() }
         XCTAssertNil(store.placeholder(for: URL(string: "https://example.test/never.png")!))
+    }
+
+    // gridImage's cells are UN-premultiplied rgba, so the CGImage must be tagged .last (not premultiplied);
+    // mislabeling renders semi-transparent placeholders too bright. White at 50% alpha over black must
+    // composite to ~50% gray.
+    func testGridImageCompositesSemiTransparentCellsCorrectly() throws {
+        let n = ImagePlaceholderConfig.gridDimension
+        let grid = ImagePlaceholder(dimension: n,
+                                    cells: Array(repeating: ImageColor(red: 255, green: 255, blue: 255, alpha: 128),
+                                                 count: n * n))
+        let image = try XCTUnwrap(ImageProcessing.gridImage(from: grid))
+        let cg = try XCTUnwrap(ImageProcessing.cgImage(from: image))
+
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        pixel.withUnsafeMutableBytes { raw in
+            let ctx = CGContext(data: raw.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            ctx.setFillColor(CGColor(gray: 0, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+        XCTAssert(abs(Int(pixel[0]) - 128) <= 6, "white at 50% alpha over black should read ~128, got \(pixel[0])")
+    }
+
+    // A file cached WITHOUT a placeholder (e.g. by a build predating the grid) must get the xattr repaired
+    // when the bytes are next served from disk - the disk-hit path computes the grid and writes it back.
+    func testPlaceholderXattrRepairedWhenServedFromDisk() throws {
+        let name = uniqueName()
+        let disk = DiskCache(name: name, byteLimit: 10 * 1024 * 1024)
+        let url = URL(string: "https://example.test/legacy.png")!
+        disk.store(pngData(width: 16, height: 16), pixelSize: CGSize(width: 16, height: 16), placeholder: nil, for: url)
+        XCTAssertNil(disk.placeholder(for: url))
+
+        let store = ImageStore(name: name)
+        defer { store.removeAll() }
+        let loaded = expectation(description: "load from disk")
+        store.load(ImageRequest(url: url)) { image in
+            XCTAssertNotNil(image, "the bytes are on disk, so the load must succeed with no network")
+            loaded.fulfill()
+        }
+        wait(for: [loaded], timeout: 5)
+        XCTAssertNotNil(disk.placeholder(for: url), "a disk-hit load should repair the missing placeholder xattr")
+    }
+
+    // MARK: - Variant: forced decode, color space, orientation
+
+    // The variant pipeline must ALWAYS redraw into a fresh bitmap, even with no width/corner transform, so
+    // the transport-format decompression happens here (off-main) rather than being deferred to first draw on
+    // the main thread. A redraw yields a new object; the un-transformed pixel size is preserved.
+    func testVariantAlwaysRedrawsEvenWithNoTransform() throws {
+        // Decode from bytes (as the real pipeline does) rather than NSImage(cgImage:), whose cgImage AppKit
+        // may rasterize at the display scale - a fixture artifact, not what production feeds variant.
+        let image = try XCTUnwrap(PlatformImage(data: pngData(width: 20, height: 20)))
+        let out = ImageProcessing.variant(from: image, targetWidth: nil, cornerRadius: 0)
+        XCTAssertFalse(out === image, "variant must redraw (force decode off-main), not return the input as-is")
+        XCTAssertNotNil(ImageProcessing.cgImage(from: out), "the redrawn variant is bitmap-backed")
+        XCTAssertEqual(ImageProcessing.pixelSize(of: out), CGSize(width: 20, height: 20))
+    }
+
+    // A wide-gamut (Display P3) source must not be clamped to sRGB by the redraw - the variant keeps an
+    // RGB-model source space.
+    func testVariantPreservesWideGamutColorSpace() throws {
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.displayP3))
+        let ctx = CGContext(data: nil, width: 60, height: 60, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 60, height: 60))
+        let cg = ctx.makeImage()!
+        #if canImport(UIKit)
+        let p3 = UIImage(cgImage: cg)
+        #else
+        let p3 = NSImage(cgImage: cg, size: CGSize(width: 60, height: 60))
+        #endif
+
+        let out = ImageProcessing.variant(from: p3, targetWidth: 30, cornerRadius: 0)
+        let outCG = try XCTUnwrap(ImageProcessing.cgImage(from: out))
+        XCTAssertEqual(outCG.colorSpace?.model, .rgb)
+        XCTAssertEqual(outCG.colorSpace?.name, CGColorSpace.displayP3, "wide-gamut space must survive the redraw")
+    }
+
+    #if canImport(UIKit)
+    // On UIKit, EXIF orientation lives in `imageOrientation` and is applied only at draw time; the pipeline
+    // draws the raw CGImage, so it must bake the rotation in first. orientedUp returns an `.up` image whose
+    // bitmap matches the DISPLAYED size (axes swapped for a 90-degree orientation).
+    func testOrientedUpBakesExifRotation() {
+        let base = makeImage(width: 40, height: 20, opaque: true)   // raw bitmap: 40 wide, 20 tall
+        let rotated = UIImage(cgImage: base.cgImage!, scale: 1, orientation: .right)  // displays 20 wide, 40 tall
+        XCTAssertEqual(rotated.size, CGSize(width: 20, height: 40))
+
+        let up = ImageProcessing.orientedUp(rotated)
+        XCTAssertEqual(up.imageOrientation, .up, "orientation must be baked into the pixels")
+        XCTAssertEqual(ImageProcessing.pixelSize(of: up), CGSize(width: 20, height: 40),
+                       "the baked bitmap matches the displayed (rotated) size")
+    }
+    #endif
+
+    // MARK: - HTTP response filtering
+
+    // A non-2xx HTTP status must be rejected so an error page served with image/HTML bytes is never cached;
+    // a 2xx status and a non-HTTP response are accepted.
+    func testAcceptableBodyRejectsNon2xxStatus() {
+        let url = URL(string: "https://example.test/x.png")!
+        let body = pngData(width: 4, height: 4)
+        let ok = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        let notFound = HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil)!
+        let serverError = HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: nil)!
+        XCTAssertEqual(ImageStore.acceptableBody(body, ok), body)
+        XCTAssertNil(ImageStore.acceptableBody(body, notFound), "a 404 body must not be cached")
+        XCTAssertNil(ImageStore.acceptableBody(body, serverError), "a 5xx body must not be cached")
+        XCTAssertEqual(ImageStore.acceptableBody(body, nil), body, "a non-HTTP response is accepted as-is")
+    }
+
+    // MARK: - Memory cost limit
+
+    func testMemoryCostReflectsDecodedBitmapSize() throws {
+        let image = makeImage(width: 100, height: 100, opaque: true)
+        let cg = try XCTUnwrap(ImageProcessing.cgImage(from: image))
+        XCTAssertEqual(ImageProcessing.memoryCost(of: image), cg.bytesPerRow * cg.height)
+        // A decoded 100x100 RGBA bitmap is at least 100*100*4 bytes regardless of the source's compression.
+        XCTAssertGreaterThanOrEqual(ImageProcessing.memoryCost(of: image), 100 * 100 * 4)
+    }
+
+    func testMemoryByteLimitConfiguredOnBothTiers() {
+        let store = ImageStore(name: uniqueName(), memoryByteLimit: 5 * 1024 * 1024)
+        defer { store.removeAll() }
+        XCTAssertEqual(store.variantByteLimit, 5 * 1024 * 1024)
+        XCTAssertEqual(store.originalByteLimit, 5 * 1024 * 1024)
+    }
+
+    // The device-scaled default stays within its platform clamp and is what a default-constructed store uses.
+    func testRecommendedMemoryByteLimitWithinClamp() {
+        let recommended = ImageStore.recommendedMemoryByteLimit()
+        #if os(macOS)
+        XCTAssertGreaterThanOrEqual(recommended, 256 * 1024 * 1024)
+        XCTAssertLessThanOrEqual(recommended, 1024 * 1024 * 1024)
+        #else
+        XCTAssertGreaterThanOrEqual(recommended, 64 * 1024 * 1024)
+        XCTAssertLessThanOrEqual(recommended, 320 * 1024 * 1024)
+        #endif
+
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        XCTAssertEqual(store.variantByteLimit, recommended, "a default store uses the recommended limit")
     }
 
     // MARK: - Performance: reading dimensions
