@@ -30,10 +30,12 @@ private final class OriginalRecord: Sendable {
     let rawData: Data
     let pixelSize: CGSize
     let placeholder: ImagePlaceholder?
-    init(rawData: Data, pixelSize: CGSize, placeholder: ImagePlaceholder?) {
+    let isAnimated: Bool
+    init(rawData: Data, pixelSize: CGSize, placeholder: ImagePlaceholder?, isAnimated: Bool) {
         self.rawData = rawData
         self.pixelSize = pixelSize
         self.placeholder = placeholder
+        self.isAnimated = isAnimated
     }
 }
 
@@ -61,6 +63,7 @@ public final class ImageStore: @unchecked Sendable {
     private let originalCache = NSCache<NSString, OriginalRecord>()
     private let pixelSizeMemo = NSCache<NSString, SizeBox>()   // sizes read from the disk xattr, memoized
     private let placeholderMemo = NSCache<NSString, PlaceholderBox>()   // placeholder grids from the xattr
+    private let animatedMemo = NSCache<NSString, NSNumber>()   // animated flag read from the disk xattr
     private let diskCache: DiskCache
     private let workQueue: DispatchQueue
 
@@ -157,6 +160,39 @@ public final class ImageStore: @unchecked Sendable {
         return nil
     }
 
+    /// The placeholder grid rendered as a ready-to-draw image (the soft-gradient preview), or nil if no
+    /// placeholder is known for the URL. A convenience over `placeholder(for:)` for consumers that render
+    /// outside SwiftUI (a UIView/NSView) - `CachedImage` shows this automatically while loading. Like the
+    /// grid itself, it is available only AFTER the image has been loaded once (the preview is derived from the
+    /// pixels), and it then survives relaunch via the on-disk xattr.
+    public func placeholderImage(for url: URL) -> PlatformImage? {
+        guard let grid = placeholder(for: url) else {
+            return nil
+        }
+        return ImageProcessing.gridImage(from: grid)
+    }
+
+    /// Whether the URL's image is a multi-frame (animated) source - an animated GIF/APNG/WebP. Thread-safe and
+    /// decode-free: resolves memory `originalCache` -> `animatedMemo` -> the on-disk xattr (with a header-count
+    /// fallback), so it survives relaunch. Returns false when unknown - like the pixel size and placeholder,
+    /// the flag is known only AFTER the image has passed through the cache once. The ready-to-draw variant is
+    /// always a single flattened frame; a consumer that wants playback reads `cachedOriginalBytes(for:)` and
+    /// drives its own animated renderer (see the design notes) - this is the signal to decide whether to.
+    public func isAnimated(for url: URL) -> Bool {
+        let key = url.absoluteString as NSString
+        if let record = originalCache.object(forKey: key) {
+            return record.isAnimated
+        }
+        if let memo = animatedMemo.object(forKey: key) {
+            return memo.boolValue
+        }
+        if let animated = diskCache.isAnimated(for: url) {
+            animatedMemo.setObject(NSNumber(value: animated), forKey: key)
+            return animated
+        }
+        return false
+    }
+
     /// The ORIGINAL transport bytes + natural pixel size for a loaded URL, or nil if not loaded. For
     /// consumers that need the source bytes (e.g. producing embeddable copy data) - the cache stays generic
     /// and does no format transcoding itself; the consumer decides how to encode.
@@ -196,6 +232,7 @@ public final class ImageStore: @unchecked Sendable {
         originalCache.removeAllObjects()
         pixelSizeMemo.removeAllObjects()
         placeholderMemo.removeAllObjects()
+        animatedMemo.removeAllObjects()
     }
 
     public func removeAll() {
@@ -267,11 +304,13 @@ public final class ImageStore: @unchecked Sendable {
     private func recordOriginal(url: URL, data: Data, decoded: PlatformImage, writeDisk: Bool) {
         let pixelSize = ImageProcessing.pixelSize(of: decoded)
         let placeholder = ImageProcessing.placeholder(of: decoded)
+        let isAnimated = ImageProcessing.isAnimated(data: data)
         // Cost = the transport bytes held resident (the compressed original); the size + grid are negligible.
-        originalCache.setObject(OriginalRecord(rawData: data, pixelSize: pixelSize, placeholder: placeholder),
+        originalCache.setObject(OriginalRecord(rawData: data, pixelSize: pixelSize,
+                                               placeholder: placeholder, isAnimated: isAnimated),
                                 forKey: url.absoluteString as NSString, cost: max(1, data.count))
         if writeDisk {
-            diskCache.store(data, pixelSize: pixelSize, placeholder: placeholder, for: url)
+            diskCache.store(data, pixelSize: pixelSize, placeholder: placeholder, isAnimated: isAnimated, for: url)
         } else if let placeholder {
             // Bytes came from the cache: files written by a build that predates the placeholder (or whose
             // attribute was stripped) never pass through store() again, so repair the xattr here.

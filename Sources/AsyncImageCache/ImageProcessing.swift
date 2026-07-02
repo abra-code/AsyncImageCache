@@ -7,6 +7,7 @@
 
 import Foundation
 import CoreGraphics
+import ImageIO
 
 #if canImport(UIKit)
 import UIKit
@@ -15,6 +16,17 @@ import AppKit
 #endif
 
 enum ImageProcessing {
+
+    /// Whether the transport bytes hold more than one frame (an animated GIF/APNG/WebP). A cheap header read
+    /// via CGImageSource - it counts frames without decoding pixels. Used to record the flag alongside the
+    /// image so a consumer can decide whether to drive its own animated renderer (the cached variant is always
+    /// a single flattened frame - animation is a consumer concern).
+    static func isAnimated(data: Data) -> Bool {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return false
+        }
+        return CGImageSourceGetCount(source) > 1
+    }
 
     /// The backing CGImage, if the platform image has one.
     static func cgImage(from image: PlatformImage) -> CGImage? {

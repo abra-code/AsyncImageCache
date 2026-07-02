@@ -44,7 +44,8 @@ final class DiskCache: @unchecked Sendable {
     /// Write the original bytes for a URL plus its pixel size and (if computed) its placeholder grid as
     /// extended attributes ON the bytes file, so both travel with the bytes and survive relaunch, then trim if
     /// the directory is over budget.
-    func store(_ data: Data, pixelSize: CGSize, placeholder: ImagePlaceholder?, for url: URL) {
+    func store(_ data: Data, pixelSize: CGSize, placeholder: ImagePlaceholder?,
+               isAnimated: Bool = false, for url: URL) {
         writeLock.lock()
         defer {
             writeLock.unlock()
@@ -55,6 +56,7 @@ final class DiskCache: @unchecked Sendable {
         if let placeholder {
             writePlaceholder(placeholder, at: file)
         }
+        writeAnimated(isAnimated, at: file)
         trimIfNeeded()
     }
 
@@ -103,6 +105,26 @@ final class DiskCache: @unchecked Sendable {
         }
         writePixelSize(size, at: file)
         return size
+    }
+
+    /// Whether the cached bytes are a multi-frame (animated) image, or nil if the file is absent. First path:
+    /// a 1-byte getxattr. Fallback: if the flag is missing but the bytes are on disk (older build, or the
+    /// attribute was stripped) count frames from the header via CGImageSource - no pixel decode - then REPAIR
+    /// the xattr so the next read is O(1). Mirrors the pixel-size resolve.
+    func isAnimated(for url: URL) -> Bool? {
+        let file = fileURL(for: url)
+        if let stored = readAnimated(at: file) {
+            return stored
+        }
+        guard fileManager.fileExists(atPath: file.path) else {
+            return nil
+        }
+        guard let source = CGImageSourceCreateWithURL(file as CFURL, nil) else {
+            return nil
+        }
+        let animated = CGImageSourceGetCount(source) > 1
+        writeAnimated(animated, at: file)
+        return animated
     }
 
     // Read width/height from the image header only (no pixel decode). CGImageSource reads incrementally, so it
@@ -251,6 +273,32 @@ final class DiskCache: @unchecked Sendable {
                 cells.append(ImageColor(red: buf[o], green: buf[o + 1], blue: buf[o + 2], alpha: buf[o + 3]))
             }
             return ImagePlaceholder(dimension: n, cells: cells)
+        }
+    }
+
+    // A single byte (0/1) recording whether the bytes are an animated image, so a consumer can decide to drive
+    // its own animated renderer without re-parsing the file. Written even when false, so the read can tell
+    // "known not animated" from "attribute absent" (which triggers the header-count fallback + repair).
+    private static let animatedAttrName = "public.asyncimagecache.animated"
+
+    private func writeAnimated(_ isAnimated: Bool, at file: URL) {
+        var byte: UInt8 = isAnimated ? 1 : 0
+        file.withUnsafeFileSystemRepresentation { path in
+            guard let path else {
+                return
+            }
+            _ = setxattr(path, DiskCache.animatedAttrName, &byte, 1, 0, XATTR_NOFOLLOW)
+        }
+    }
+
+    private func readAnimated(at file: URL) -> Bool? {
+        return file.withUnsafeFileSystemRepresentation { path -> Bool? in
+            guard let path else {
+                return nil
+            }
+            var byte: UInt8 = 0
+            let read = getxattr(path, DiskCache.animatedAttrName, &byte, 1, 0, XATTR_NOFOLLOW)
+            return read == 1 ? (byte != 0) : nil
         }
     }
 

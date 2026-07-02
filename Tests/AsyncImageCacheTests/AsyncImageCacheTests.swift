@@ -400,6 +400,81 @@ final class AsyncImageCacheTests: XCTestCase {
         XCTAssertNotNil(disk.placeholder(for: url), "a disk-hit load should repair the missing placeholder xattr")
     }
 
+    // MARK: - Animated detection + placeholder image
+
+    // A minimal multi-frame GIF (solid frames of shifting color), for the animated-source paths.
+    private func animatedGIF(size: Int = 24, frames: Int = 4) -> Data {
+        let out = NSMutableData()
+        let dest = CGImageDestinationCreateWithData(out, "com.compuserve.gif" as CFString, frames, nil)!
+        CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary:
+            [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        for f in 0..<frames {
+            let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            ctx.setFillColor(red: CGFloat(f) / CGFloat(frames), green: 0.4, blue: 0.6, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+            CGImageDestinationAddImage(dest, ctx.makeImage()!, [kCGImagePropertyGIFDictionary:
+                [kCGImagePropertyGIFUnclampedDelayTime: 0.1]] as CFDictionary)
+        }
+        _ = CGImageDestinationFinalize(dest)
+        return out as Data
+    }
+
+    func testIsAnimatedDetectionFromData() {
+        XCTAssertTrue(ImageProcessing.isAnimated(data: animatedGIF()))
+        XCTAssertFalse(ImageProcessing.isAnimated(data: pngData(width: 8, height: 8)))
+        XCTAssertFalse(ImageProcessing.isAnimated(data: gradientJPEG(width: 16, height: 16)))
+    }
+
+    func testStoreReportsAnimatedAfterLoad() {
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let gifURL = URL(string: "data:image/gif;base64,\(animatedGIF().base64EncodedString())")!
+        let pngURL = dataURL(png: pngData(width: 10, height: 10))
+
+        XCTAssertFalse(store.isAnimated(for: gifURL), "unknown (false) before the image is loaded")
+
+        let e1 = expectation(description: "gif")
+        store.load(ImageRequest(url: gifURL)) { _ in e1.fulfill() }
+        let e2 = expectation(description: "png")
+        store.load(ImageRequest(url: pngURL)) { _ in e2.fulfill() }
+        wait(for: [e1, e2], timeout: 5)
+
+        XCTAssertTrue(store.isAnimated(for: gifURL), "an animated GIF must be flagged animated after load")
+        XCTAssertFalse(store.isAnimated(for: pngURL), "a PNG is not animated")
+    }
+
+    // The disk tier recovers the flag from the header frame count when the xattr is absent, and repairs it.
+    func testDiskAnimatedHeaderFallbackAndRepair() throws {
+        let disk = DiskCache(name: uniqueName(), byteLimit: 10 * 1024 * 1024)
+        defer { disk.removeAll() }
+        let gifURL = URL(string: "https://example.test/motion.gif")!
+        let pngURL = URL(string: "https://example.test/still.png")!
+        // Write bytes straight to the cache file (bypassing store()), so no animated xattr exists yet.
+        try animatedGIF().write(to: disk.fileURL(for: gifURL))
+        try pngData(width: 8, height: 8).write(to: disk.fileURL(for: pngURL))
+
+        XCTAssertEqual(disk.isAnimated(for: gifURL), true, "header frame-count fallback must detect animation")
+        XCTAssertEqual(disk.isAnimated(for: pngURL), false, "a single-frame image is not animated")
+        let len = getxattr(disk.fileURL(for: gifURL).path, "public.asyncimagecache.animated", nil, 0, 0, 0)
+        XCTAssertEqual(len, 1, "the fallback should write the 1-byte animated xattr back (repair)")
+    }
+
+    func testPlaceholderImageRendersAfterLoad() throws {
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let url = dataURL(png: pngData(width: 16, height: 16))
+        XCTAssertNil(store.placeholderImage(for: url), "no preview image before the image is loaded")
+
+        let e = expectation(description: "load")
+        store.load(ImageRequest(url: url)) { _ in e.fulfill() }
+        wait(for: [e], timeout: 5)
+
+        let preview = try XCTUnwrap(store.placeholderImage(for: url), "a preview image should exist after load")
+        XCTAssertGreaterThan(ImageProcessing.pixelSize(of: preview).width, 0)
+    }
+
     // MARK: - Variant: forced decode, color space, orientation
 
     // The variant pipeline must ALWAYS redraw into a fresh bitmap, even with no width/corner transform, so
