@@ -1,0 +1,2 @@
+# Keeps the folder-reference path present at `xcodegen generate` time.
+# The build-time generator (Scripts/generate-images.swift) populates this folder; its output is gitignored.

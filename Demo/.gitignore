@@ -1,0 +1,11 @@
+
+# Build-time-generated demo images (see Scripts/generate-images.swift). Not committed - kept out of git so the
+# repo carries no large binary blobs; regenerated on the next build.
+GeneratedResources/*
+!GeneratedResources/.gitkeep
+
+# Xcode build artifacts
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/

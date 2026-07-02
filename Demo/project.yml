@@ -1,0 +1,60 @@
+name: AsyncImageCacheDemo
+
+options:
+  bundleIdPrefix: com.abracode.aicdemo
+  deploymentTarget:
+    iOS: "16.0"
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+packages:
+  AsyncImageCache:
+    path: ..
+
+# The build-time image generator, shared by both targets. Idempotent (skips existing files), writes into the
+# gitignored GeneratedResources folder, and is forced to the macOS host SDK so it runs the same for an iOS
+# build. User script sandboxing is disabled so it may write into the source tree.
+scriptDefaults: &generateImages
+  name: Generate demo images
+  script: |
+    set -e
+    xcrun --sdk macosx swift "$PROJECT_DIR/Scripts/generate-images.swift" "$PROJECT_DIR/GeneratedResources"
+  basedOnDependencyAnalysis: false
+
+targetDefaults: &appSources
+  - path: App
+  - path: GeneratedResources
+    type: folder
+
+targets:
+  AsyncImageCacheDemo-iOS:
+    type: application
+    platform: iOS
+    sources: *appSources
+    dependencies:
+      - package: AsyncImageCache
+    preBuildScripts:
+      - *generateImages
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  AsyncImageCacheDemo-macOS:
+    type: application
+    platform: macOS
+    sources: *appSources
+    dependencies:
+      - package: AsyncImageCache
+    preBuildScripts:
+      - *generateImages
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
