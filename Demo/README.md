@@ -13,8 +13,10 @@ local and remote images side by side, so you can watch the library's behavior in
   decoded variants and reloads them (and the placeholder reappears on the reload).
 - The two-tier cache: "Clear memory" then scroll to see the disk tier serve instantly; "Clear memory + disk"
   to force a cold reload (locals re-read from the bundle, remotes re-fetch).
-- Animated sources: one generated GIF carries an "animated" badge (from `store.isAnimated(for:)`) and renders
-  as its flattened first frame - playback is a consumer concern, see ../Private/Animated_GIF_Playback_Analysis.md.
+- Animated sources: one generated GIF carries an "animated" badge (from `store.isAnimated(for:)`). CachedImage
+  renders its flattened first frame; tap the Play button to layer a consumer-driven frame player on top - it
+  sources the bytes from `store.cachedOriginalBytes(for:)` and steps frames + per-frame delays via
+  CGImageSource. Playback is a consumer concern, so it lives in the app, not the cache.
 
 Local images are LARGE gradients (plus one animated GIF) generated at build time; remote images come from
 picsum.photos (needs a network connection).

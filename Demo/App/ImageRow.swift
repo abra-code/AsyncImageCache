@@ -23,6 +23,7 @@ struct ImageRow: View {
     let reloadToken: UUID
 
     @State private var isAnimated = false
+    @State private var playing = false
     @State private var loadTick = 0   // bumped after the load completes, to refresh the derived views
 
     var body: some View {
@@ -65,13 +66,41 @@ struct ImageRow: View {
     private var content: some View {
         if showPlaceholderOnly {
             placeholderOnly
+        } else if isAnimated {
+            animatedContent
         } else {
-            CachedImage(url: item.url,
-                        intrinsicSize: item.intrinsicSize,
-                        cornerRadius: 14,
-                        contentMode: .fill,
-                        maxPixelWidth: maxPixelWidth,
-                        store: store)
+            cachedImageView
+        }
+    }
+
+    private var cachedImageView: some View {
+        CachedImage(url: item.url,
+                    intrinsicSize: item.intrinsicSize,
+                    cornerRadius: 14,
+                    contentMode: .fill,
+                    maxPixelWidth: maxPixelWidth,
+                    store: store)
+    }
+
+    // For animated sources: CachedImage shows the flattened first frame (the library's default); tapping Play
+    // layers the consumer-driven frame player on top. Demonstrates that animation lives in the app, not the cache.
+    private var animatedContent: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if playing {
+                AnimatedGIFView(url: item.url, store: store, intrinsicSize: item.intrinsicSize)
+            } else {
+                cachedImageView
+            }
+            Button {
+                playing.toggle()
+            } label: {
+                Image(systemName: playing ? "pause.circle.fill" : "play.circle.fill")
+                    .font(.title)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.white, .black.opacity(0.4))
+            }
+            .buttonStyle(.plain)
+            .padding(10)
         }
     }
 
