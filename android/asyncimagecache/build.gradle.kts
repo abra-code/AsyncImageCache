@@ -9,6 +9,12 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// Coordinate for consumption as a Gradle composite build: ActionUIAndroid declares a dependency on
+// `com.abracode:asyncimagecache` and includeBuild substitutes this project for it (see settings.gradle.kts).
+// The group must be set for that automatic substitution to match.
+group = "com.abracode"
+version = "0.1.0"
+
 android {
     namespace = "com.abracode.asyncimagecache"
     compileSdk = 36
