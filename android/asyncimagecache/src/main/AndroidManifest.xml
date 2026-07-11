@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Remote image fetch. The library owns its own on-disk cache, so no other permissions are required. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+</manifest>

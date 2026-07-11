@@ -1,0 +1,52 @@
+## Version catalog for the Android port of AsyncImageCache.
+##
+## Pinned to the ActionUIAndroid toolchain (verified against the local Gradle cache) so the composite build
+## (includeBuild from ActionUIAndroid) never has to reconcile version skew. Runtime dependencies are limited to
+## the OS SDK + Kotlin stdlib + kotlinx-coroutines + AndroidX/Compose baseline; test scope adds only JUnit and
+## the AndroidX test runner. No Coil, no Glide, no OkHttp - per the porting plan's zero-third-party constraint.
+
+[versions]
+agp = "9.2.1"
+kotlin = "2.2.10"
+coroutines = "1.10.2"
+androidxCore = "1.18.0"
+composeBom = "2026.03.00"
+activityCompose = "1.10.1"
+lifecycle = "2.7.0"
+# Test scope only (never ships).
+junit = "4.13.2"
+androidxTestExtJunit = "1.1.5"
+androidxTestRunner = "1.5.2"
+androidxTestCore = "1.5.0"
+espresso = "3.5.1"
+
+[libraries]
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "androidxCore" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+
+# Compose - versions managed by the BOM, so the individual artifacts carry no explicit version.
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-compose-foundation = { group = "androidx.compose.foundation", name = "foundation" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-compose-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+
+# Test.
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
+androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExtJunit" }
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
+androidx-test-core = { group = "androidx.test", name = "core", version.ref = "androidxTestCore" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espresso" }
+androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
+androidx-compose-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
+
+[plugins]
+android-library = { id = "com.android.library", version.ref = "agp" }
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
