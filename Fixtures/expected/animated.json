@@ -1,0 +1,14 @@
+{
+  "animated" : true,
+  "file" : "animated.gif",
+  "headerPixelSize" : {
+    "height" : 24,
+    "width" : 24
+  },
+  "name" : "animated",
+  "variant" : {
+    "height" : 12,
+    "targetWidth" : 12,
+    "width" : 12
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "animated" : false,
+  "file" : "exif-rotated.jpg",
+  "headerPixelSize" : {
+    "height" : 100,
+    "width" : 40
+  },
+  "name" : "exif-rotated",
+  "variant" : {
+    "height" : 50,
+    "targetWidth" : 20,
+    "width" : 20
+  }
+}

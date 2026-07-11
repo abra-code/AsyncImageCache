@@ -34,6 +34,16 @@ android {
         compose = true
     }
 
+    // Stage F cross-platform parity fixtures live at the repo root (Fixtures/images + Fixtures/expected), shared
+    // byte-for-byte with the Swift emitter. Mount them as androidTest assets so the instrumented parity suite
+    // reads THE SAME files the Swift side emitted - one fixture set, two consumers. This module is at
+    // android/asyncimagecache, so ../../Fixtures is the repo root Fixtures/.
+    sourceSets {
+        getByName("androidTest") {
+            assets.srcDir("../../Fixtures")
+        }
+    }
+
     // Graphics-touching tests run instrumented on an emulator; pure-logic tests run on the JVM. Return default
     // values from android.* stubs is off - JVM tests here never touch android.graphics (that is androidTest).
     testOptions {
