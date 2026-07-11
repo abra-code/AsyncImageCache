@@ -168,31 +168,39 @@ internal object ImageProcessing {
             return source
         }
 
-        val scaled = if (width == naturalWidth && height == naturalHeight) {
+        // Wrap the allocations: an OutOfMemoryError from createScaledBitmap/createBitmap on a large source must
+        // not escape (the Swift reference returns the original image on any failure and never throws - letting it
+        // propagate would crash the work thread and leave the caller's in-flight entry dangling). On failure,
+        // fall back to the source so a degraded-but-present image is still delivered.
+        return try {
+            val scaled = if (width == naturalWidth && height == naturalHeight) {
+                source
+            } else {
+                Bitmap.createScaledBitmap(source, width, height, true)
+            }
+
+            if (cornerRadius <= 0f) {
+                return scaled
+            }
+
+            val radius = min(cornerRadius, min(width, height) / 2f)
+            val colorSpace = scaled.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
+            // ARGB_8888 with alpha so the masked-off corners are transparent; keep the source's (possibly wide)
+            // color space so P3 is not clamped to sRGB.
+            val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888, true, colorSpace)
+            val canvas = Canvas(output)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                isFilterBitmap = true
+                shader = BitmapShader(scaled, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+            }
+            canvas.drawRoundRect(RectF(0f, 0f, width.toFloat(), height.toFloat()), radius, radius, paint)
+
+            if (scaled !== source) {
+                scaled.recycle()
+            }
+            output
+        } catch (t: Throwable) {
             source
-        } else {
-            Bitmap.createScaledBitmap(source, width, height, true)
         }
-
-        if (cornerRadius <= 0f) {
-            return scaled
-        }
-
-        val radius = min(cornerRadius, min(width, height) / 2f)
-        val colorSpace = scaled.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
-        // ARGB_8888 with alpha so the masked-off corners are transparent; keep the source's (possibly wide)
-        // color space so P3 is not clamped to sRGB.
-        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888, true, colorSpace)
-        val canvas = Canvas(output)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            isFilterBitmap = true
-            shader = BitmapShader(scaled, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-        }
-        canvas.drawRoundRect(RectF(0f, 0f, width.toFloat(), height.toFloat()), radius, radius, paint)
-
-        if (scaled !== source) {
-            scaled.recycle()
-        }
-        return output
     }
 }

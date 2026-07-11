@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Test-only manifest. The integration tests talk to an in-process TestHttpServer over plain HTTP on
+     127.0.0.1, which Android blocks by default (cleartext disabled since API 28). Enabling cleartext here
+     affects the androidTest APK only - it never ships in the library. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:usesCleartextTraffic="true" />
+</manifest>
