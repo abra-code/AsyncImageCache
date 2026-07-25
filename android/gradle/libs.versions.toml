@@ -6,7 +6,7 @@
 ## the AndroidX test runner. No Coil, no Glide, no OkHttp - per the porting plan's zero-third-party constraint.
 
 [versions]
-agp = "9.2.1"
+agp = "9.3.1"
 kotlin = "2.2.10"
 coroutines = "1.10.2"
 androidxCore = "1.18.0"
