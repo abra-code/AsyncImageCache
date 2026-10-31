@@ -10,6 +10,8 @@
 // attributes ON the bytes file. Android app storage has no dependable xattr, so each field lives in a sidecar
 // `<hash>.meta` file next to the bytes, encoded by ImageMetaCodec. The "attribute absent -> read the header and
 // repair" fallbacks are preserved exactly (see pixelSize / isAnimated).
+//
+// Local file: and content: images are not kept here (see holds).
 
 package com.abracode.asyncimagecache
 
@@ -39,10 +41,13 @@ internal class DiskCache(
 
     private fun metaFileForUrl(url: String): File = File(directory, hash(url) + META_SUFFIX)
 
-    fun fileExists(url: String): Boolean = fileForUrl(url).exists()
+    fun fileExists(url: String): Boolean = holds(url) && fileForUrl(url).exists()
 
     /** The cached original bytes for a URL, or null on a miss. Safe to call off the main thread. */
     fun data(url: String): ByteArray? {
+        if (!holds(url)) {
+            return null
+        }
         val file = fileForUrl(url)
         return try {
             if (file.exists()) file.readBytes() else null
@@ -57,6 +62,9 @@ internal class DiskCache(
      * directory is over budget. Bytes and meta are each written atomically (temp file + rename).
      */
     fun store(data: ByteArray, pixelSize: Size, placeholder: ImagePlaceholder?, isAnimated: Boolean, url: String) {
+        if (!holds(url)) {
+            return
+        }
         writeLock.withLock {
             val file = fileForUrl(url)
             if (!writeAtomically(file, data)) {
@@ -85,6 +93,9 @@ internal class DiskCache(
      * this after computing the grid, so the meta self-repairs. A cheap presence check when it is already there.
      */
     fun storePlaceholderIfMissing(placeholder: ImagePlaceholder, url: String) {
+        if (!holds(url)) {
+            return
+        }
         if (readMeta(url)?.placeholder != null) {
             return
         }
@@ -149,6 +160,9 @@ internal class DiskCache(
     // Read + decode the sidecar meta, or null if absent/corrupt. Lock-free (a plain file read), like the Swift
     // getxattr reads.
     private fun readMeta(url: String): ImageMeta? {
+        if (!holds(url)) {
+            return null
+        }
         val file = metaFileForUrl(url)
         return try {
             if (file.exists()) ImageMetaCodec.decode(file.readBytes()) else null
@@ -194,6 +208,15 @@ internal class DiskCache(
     }
 
     companion object {
+        /**
+         * Whether this tier keeps a URL's image: every scheme but the local file: and content:. A local file is its
+         * own copy, and a copy here would go on showing the old picture after the file is edited.
+         */
+        fun holds(url: String): Boolean {
+            val scheme = url.substringBefore(':', missingDelimiterValue = "").lowercase()
+            return scheme != "file" && scheme != "content"
+        }
+
         private const val META_SUFFIX = ".meta"
         private const val TEMP_SUFFIX = ".tmp"
         private val HASH_REGEX = Regex("^[0-9a-f]{64}$")

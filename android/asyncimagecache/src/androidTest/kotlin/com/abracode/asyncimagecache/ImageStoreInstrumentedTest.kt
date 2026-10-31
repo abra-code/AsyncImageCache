@@ -94,44 +94,64 @@ class ImageStoreInstrumentedTest {
 
     @Test fun diskPersistenceAcrossFreshInstance() {
         val name = uniqueName()
-        val tempFile = File(context.cacheDir, "aic-${UUID.randomUUID()}.png").apply { writeBytes(pngBytes(30, 20)) }
-        val fileUrl = tempFile.toURI().toString()   // file:///...
-        val request = ImageRequest(fileUrl)
+        val url = dataUrl(pngBytes(30, 20))
+        val request = ImageRequest(url)
 
         val first = ImageStore(context, name)
         assertNotNull(loadBlocking(first, request))
         assertTrue("disk dir under cacheDir/AsyncImageCache/<name>",
             first.diskDirectory.path.contains("AsyncImageCache/$name"))
-        assertTrue("original bytes on disk", first.diskFileExists(fileUrl))
+        assertTrue("original bytes on disk", first.diskFileExists(url))
 
-        // Delete the source so any later success MUST come from disk, not the file: path.
-        assertTrue(tempFile.delete())
+        // The data: URL could decode itself, so swap the cached bytes for a different picture: only a load served
+        // from disk sees it.
+        DiskCache(context.cacheDir, name, 10L * 1024 * 1024).fileForUrl(url).writeBytes(pngBytes(60, 20))
 
         val second = ImageStore(context, name)
         try {
             assertNull("fresh instance starts with empty memory", second.cachedImage(request))
-            assertNotNull("fresh instance serves the deleted file from disk", loadBlocking(second, request))
-            assertNotNull(second.cachedOriginalBytes(fileUrl))
+            assertNotNull("fresh instance serves the image", loadBlocking(second, request))
+            assertEquals("original bytes come from disk", Size(60, 20), second.cachedOriginalBytes(url)?.pixelSize)
         } finally {
             second.removeAll()
         }
     }
 
+    // A local file is its own copy: it is never kept in the disk tier, so after it is edited a fresh store (a
+    // relaunch) shows the new picture, not the old one.
+    @Test fun localFileImagesSkipTheDiskCache() {
+        val name = uniqueName()
+        val tempFile = File(context.cacheDir, "aic-${UUID.randomUUID()}.png").apply { writeBytes(pngBytes(30, 20)) }
+        val fileUrl = tempFile.toURI().toString()   // file:///...
+        val first = ImageStore(context, name)
+        try {
+            assertNotNull(loadBlocking(first, ImageRequest(fileUrl)))
+            assertFalse("a local file is not copied into the disk cache", first.diskFileExists(fileUrl))
+
+            tempFile.writeBytes(pngBytes(40, 10))
+            val second = ImageStore(context, name)
+            assertNull("nothing about the old file was kept", second.cachedPixelSize(fileUrl))
+            assertNotNull(loadBlocking(second, ImageRequest(fileUrl)))
+            assertEquals("the edited file is shown", Size(40, 10), second.cachedPixelSize(fileUrl))
+        } finally {
+            first.removeAll()
+            tempFile.delete()
+        }
+    }
+
     @Test fun pixelSizeSurvivesRelaunchWithoutDecoding() {
         val name = uniqueName()
-        val tempFile = File(context.cacheDir, "aic-${UUID.randomUUID()}.png").apply { writeBytes(pngBytes(123, 45)) }
-        val fileUrl = tempFile.toURI().toString()
-        val request = ImageRequest(fileUrl)
+        val url = dataUrl(pngBytes(123, 45))
+        val request = ImageRequest(url)
 
         val store = ImageStore(context, name)
         assertNotNull(loadBlocking(store, request))
-        assertEquals(Size(123, 45), store.cachedPixelSize(fileUrl))
+        assertEquals(Size(123, 45), store.cachedPixelSize(url))
 
-        assertTrue(tempFile.delete())
         val second = ImageStore(context, name)
         try {
             assertNull(second.cachedImage(request))
-            assertEquals("size read from the disk meta, no decode", Size(123, 45), second.cachedPixelSize(fileUrl))
+            assertEquals("size read from the disk meta, no decode", Size(123, 45), second.cachedPixelSize(url))
         } finally {
             second.removeAll()
         }
@@ -139,17 +159,15 @@ class ImageStoreInstrumentedTest {
 
     @Test fun placeholderSurvivesRelaunch() {
         val name = uniqueName()
-        val tempFile = File(context.cacheDir, "aic-${UUID.randomUUID()}.png").apply { writeBytes(pngBytes(16, 16)) }
-        val fileUrl = tempFile.toURI().toString()
+        val url = dataUrl(pngBytes(16, 16))
         val store = ImageStore(context, name)
-        assertNotNull(loadBlocking(store, ImageRequest(fileUrl)))
-        val afterLoad = store.placeholder(fileUrl)!!
+        assertNotNull(loadBlocking(store, ImageRequest(url)))
+        val afterLoad = store.placeholder(url)!!
         assertEquals(6, afterLoad.dimension)
 
-        assertTrue(tempFile.delete())
         val second = ImageStore(context, name)
         try {
-            assertEquals("grid round-trips via the meta, no decode", afterLoad, second.placeholder(fileUrl))
+            assertEquals("grid round-trips via the meta, no decode", afterLoad, second.placeholder(url))
         } finally {
             second.removeAll()
         }

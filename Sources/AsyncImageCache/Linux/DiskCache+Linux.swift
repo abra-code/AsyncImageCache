@@ -8,6 +8,7 @@
 //
 // The per-file metadata (pixel size, animated flag, placeholder grid) lives in a `<hash>.meta` sidecar
 // (ImageMetaCodec), not in extended attributes; the "absent -> read the header and repair" fallbacks are kept.
+// Local file: images are not kept here (see holds(_:)).
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -37,6 +38,12 @@ final class DiskCache: Sendable {
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
     }
 
+    /// Whether this tier keeps a URL's image: every scheme but file:. A local file is its own copy, and a copy
+    /// here would go on showing the old picture after the file is edited.
+    static func holds(_ url: URL) -> Bool {
+        url.scheme?.lowercased() != "file"
+    }
+
     func fileURL(for url: URL) -> URL {
         directoryURL.appendingPathComponent(Self.hash(url.absoluteString), isDirectory: false)
     }
@@ -46,18 +53,24 @@ final class DiskCache: Sendable {
     }
 
     func fileExists(for url: URL) -> Bool {
-        FileManager.default.fileExists(atPath: fileURL(for: url).path)
+        Self.holds(url) && FileManager.default.fileExists(atPath: fileURL(for: url).path)
     }
 
     /// The cached original bytes for a URL, or nil on a miss. Safe to call off the main thread.
     func data(for url: URL) -> Data? {
-        try? Data(contentsOf: fileURL(for: url))
+        guard Self.holds(url) else {
+            return nil
+        }
+        return try? Data(contentsOf: fileURL(for: url))
     }
 
     /// Write the original bytes for a URL and its metadata sidecar (each atomically), then trim if the folder is
     /// over budget.
     func store(_ data: Data, pixelSize: ImageSize, placeholder: ImagePlaceholder?,
                isAnimated: Bool = false, for url: URL) {
+        guard Self.holds(url) else {
+            return
+        }
         writeLock.withLock { _ in
             do {
                 try data.write(to: fileURL(for: url), options: .atomic)
@@ -97,6 +110,9 @@ final class DiskCache: Sendable {
     /// The natural pixel size of a cached image WITHOUT decoding it: from the sidecar, or, when that has none but
     /// the bytes are on disk, from the image HEADER (then the sidecar is repaired). nil when neither yields one.
     func pixelSize(for url: URL) -> ImageSize? {
+        guard Self.holds(url) else {
+            return nil
+        }
         if let size = readMeta(for: url)?.pixelSize {
             return ImageSize(width: ImageLength(size.width), height: ImageLength(size.height))
         }
@@ -144,7 +160,7 @@ final class DiskCache: Sendable {
     // attribute on Apple platforms goes with its file). Lock-free (plain file reads): writes replace the file
     // atomically, so a read sees the old record or the new one.
     private func readMeta(for url: URL) -> ImageMeta? {
-        guard FileManager.default.fileExists(atPath: fileURL(for: url).path),
+        guard Self.holds(url), FileManager.default.fileExists(atPath: fileURL(for: url).path),
               let bytes = try? Data(contentsOf: metaURL(for: url)) else {
             return nil
         }
@@ -160,7 +176,7 @@ final class DiskCache: Sendable {
     // leaves a sidecar without its file.
     private func repairMeta(for url: URL, _ change: (inout ImageMeta) -> Void) {
         writeLock.withLock { _ in
-            guard FileManager.default.fileExists(atPath: fileURL(for: url).path) else {
+            guard Self.holds(url), FileManager.default.fileExists(atPath: fileURL(for: url).path) else {
                 return
             }
             var meta = readMeta(for: url) ?? ImageMeta()

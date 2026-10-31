@@ -7,7 +7,9 @@
 // Two tiers:
 //   - in-memory: an NSCache of ready-to-draw variants (keyed by the full ImageRequest) + an NSCache of
 //     originals (raw transport bytes + natural pixel size, keyed by URL).
-//   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads.
+//   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads. Not
+//     for local file: images, which are read from their file again; what the docs below say survives relaunch
+//     (pixel size, placeholder, animated flag) is then known only while the image is in memory.
 //
 // Size-known-upfront: once an image has been loaded once, `cachedPixelSize(for:)` returns its natural size
 // synchronously, so a consumer can reserve layout space before the pixels of a later variant arrive.

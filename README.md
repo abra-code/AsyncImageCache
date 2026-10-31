@@ -73,7 +73,9 @@ ImageStore.shared.load(ImageRequest(url: url, targetWidth: 840, cornerRadius: 10
     `memoryByteLimit` caps each tier (default 100 MB).
   - On disk: the ORIGINAL transport bytes under `<Caches>/AsyncImageCache/<name>/`, filenames = `SHA256(url)`,
     with a soft byte budget enforced by an LRU-ish trim (oldest-by-mtime). Survives relaunch; the OS may
-    still evict Caches (a miss just falls through to the network).
+    still evict Caches (a miss just falls through to the network). Local `file:` images (and `content:` on
+    Android) are never copied here: the file is its own copy, and a copy would go on showing the old picture
+    after the file is edited.
 - Byte resolution order (off-main): in-memory originals -> disk -> source (`data:`/`file:` decode locally,
   `http(s)` via `URLSession`).
 - Variant key quantization: `targetWidth` / `cornerRadius` are `CGFloat` in the API (caller convenience) but

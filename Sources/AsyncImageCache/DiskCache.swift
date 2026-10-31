@@ -4,7 +4,8 @@
 // enables offline reads. Files live under <Caches>/AsyncImageCache/<name>/ and are named by a stable
 // SHA256 hex of the URL string. A soft byte budget is enforced with an LRU-ish trim that evicts the oldest
 // files (by modification date) once the directory is over budget. The OS may also evict the whole Caches
-// directory at any time, which is fine: a miss just falls through to the network.
+// directory at any time, which is fine: a miss just falls through to the network. Local file: images are not
+// kept here (see holds(_:)).
 
 import Foundation
 import CoreGraphics
@@ -28,17 +29,26 @@ final class DiskCache: @unchecked Sendable {
         try? fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
     }
 
+    /// Whether this tier keeps a URL's image: every scheme but file:. A local file is its own copy, and a copy
+    /// here would go on showing the old picture after the file is edited.
+    static func holds(_ url: URL) -> Bool {
+        url.scheme?.lowercased() != "file"
+    }
+
     func fileURL(for url: URL) -> URL {
         directoryURL.appendingPathComponent(Self.hash(url.absoluteString), isDirectory: false)
     }
 
     func fileExists(for url: URL) -> Bool {
-        fileManager.fileExists(atPath: fileURL(for: url).path)
+        Self.holds(url) && fileManager.fileExists(atPath: fileURL(for: url).path)
     }
 
     /// The cached original bytes for a URL, or nil on a miss. Safe to call off the main thread.
     func data(for url: URL) -> Data? {
-        try? Data(contentsOf: fileURL(for: url))
+        guard Self.holds(url) else {
+            return nil
+        }
+        return try? Data(contentsOf: fileURL(for: url))
     }
 
     /// Write the original bytes for a URL plus its pixel size and (if computed) its placeholder grid as
@@ -46,6 +56,9 @@ final class DiskCache: @unchecked Sendable {
     /// the directory is over budget.
     func store(_ data: Data, pixelSize: CGSize, placeholder: ImagePlaceholder?,
                isAnimated: Bool = false, for url: URL) {
+        guard Self.holds(url) else {
+            return
+        }
         writeLock.lock()
         defer {
             writeLock.unlock()
@@ -65,6 +78,9 @@ final class DiskCache: @unchecked Sendable {
     /// for a placeholder); an absent/invalid value simply means the caller falls back to a neutral placeholder
     /// and the next real load computes + stores it.
     func placeholder(for url: URL) -> ImagePlaceholder? {
+        guard Self.holds(url) else {
+            return nil
+        }
         return readPlaceholder(at: fileURL(for: url))
     }
 
@@ -73,6 +89,9 @@ final class DiskCache: @unchecked Sendable {
     /// - the disk-hit load path calls this after computing the grid, so the attribute self-repairs. A cheap
     /// size-only getxattr probe when the attribute is already there.
     func storePlaceholderIfMissing(_ placeholder: ImagePlaceholder, for url: URL) {
+        guard Self.holds(url) else {
+            return
+        }
         let file = fileURL(for: url)
         let present = file.withUnsafeFileSystemRepresentation { path -> Bool in
             guard let path else {
@@ -96,6 +115,9 @@ final class DiskCache: @unchecked Sendable {
     /// CGImageSource - still no full decode - then REPAIR the xattr so the next read is back on the fast path.
     /// nil only when neither the attribute nor the file yields a size.
     func pixelSize(for url: URL) -> CGSize? {
+        guard Self.holds(url) else {
+            return nil
+        }
         let file = fileURL(for: url)
         if let size = readPixelSize(at: file) {
             return size
@@ -112,6 +134,9 @@ final class DiskCache: @unchecked Sendable {
     /// attribute was stripped) count frames from the header via CGImageSource - no pixel decode - then REPAIR
     /// the xattr so the next read is O(1). Mirrors the pixel-size resolve.
     func isAnimated(for url: URL) -> Bool? {
+        guard Self.holds(url) else {
+            return nil
+        }
         let file = fileURL(for: url)
         if let stored = readAnimated(at: file) {
             return stored

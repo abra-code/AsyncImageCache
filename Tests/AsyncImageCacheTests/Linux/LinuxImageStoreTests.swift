@@ -67,7 +67,28 @@ final class LinuxImageStoreTests: XCTestCase {
         XCTAssertTrue(results[0] === results[1], "one production serves both")
     }
 
-    func testFileURLPersistsAcrossStoresAndRelaunch() throws {
+    func testImagePersistsAcrossStoresAndRelaunch() throws {
+        let name = uniqueName()
+        let source = dataURL(png: try pngData(width: 30, height: 20))
+        let first = makeStore(name: name)
+        XCTAssertNotNil(load(first, ImageRequest(url: source)))
+        XCTAssertTrue(first.diskFileExists(for: source))
+
+        // A new store of the same name (a relaunch): the size, grid and flag come from the sidecar, no decode.
+        let second = ImageStore(name: name)
+        XCTAssertEqual(second.cachedPixelSize(for: source), ImageSize(width: 30, height: 20))
+        XCTAssertNotNil(second.placeholder(for: source))
+        XCTAssertFalse(second.isAnimated(for: source))
+        // ...and the bytes come from disk: the data: URL could decode itself, so the cached bytes are swapped for
+        // a different picture that only a disk hit sees.
+        try pngData(width: 60, height: 20).write(to: DiskCache(name: name, byteLimit: 1 << 20).fileURL(for: source))
+        let image = try XCTUnwrap(load(second, ImageRequest(url: source, targetWidth: 15)))
+        XCTAssertEqual([image.pixelWidth, image.pixelHeight], [15, 5])
+    }
+
+    // A local file is its own copy: it is never kept in the disk tier, so after it is edited a new store (a
+    // relaunch) shows the new picture, not the old one.
+    func testLocalFileImagesSkipTheDiskCache() throws {
         let name = uniqueName()
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("\(name).png")
         try pngData(width: 30, height: 20).write(to: file)
@@ -76,16 +97,13 @@ final class LinuxImageStoreTests: XCTestCase {
         }
         let first = makeStore(name: name)
         XCTAssertNotNil(load(first, ImageRequest(url: file)))
+        XCTAssertFalse(first.diskFileExists(for: file), "a local file is not copied into the disk cache")
 
-        // A new store of the same name (a relaunch): the size, grid and flag come from the sidecar, no decode.
+        try pngData(width: 40, height: 10).write(to: file)
         let second = ImageStore(name: name)
-        XCTAssertEqual(second.cachedPixelSize(for: file), ImageSize(width: 30, height: 20))
-        XCTAssertNotNil(second.placeholder(for: file))
-        XCTAssertFalse(second.isAnimated(for: file))
-        // ...and the bytes come from disk even when the source is gone.
-        try FileManager.default.removeItem(at: file)
-        let image = try XCTUnwrap(load(second, ImageRequest(url: file, targetWidth: 15)))
-        XCTAssertEqual([image.pixelWidth, image.pixelHeight], [15, 10])
+        XCTAssertNil(second.cachedPixelSize(for: file), "nothing about the old file was kept")
+        let image = try XCTUnwrap(load(second, ImageRequest(url: file)))
+        XCTAssertEqual([image.pixelWidth, image.pixelHeight], [40, 10], "the edited file is shown")
     }
 
     func testUnknownSchemeAndUndecodableBytesDeliverNil() {

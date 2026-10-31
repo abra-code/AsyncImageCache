@@ -8,7 +8,9 @@
 // Two tiers:
 //   - in-memory: MemoryCache maps of ready-to-draw variants (keyed by the full ImageRequest) and of originals
 //     (raw transport bytes + natural pixel size, keyed by URL).
-//   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads.
+//   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads. Not
+//     for local file: images, which are read from their file again; what the docs below say survives relaunch
+//     (pixel size, placeholder, animated flag) is then known only while the image is in memory.
 //
 // Loading: data: and file: URLs are read on the work queue; http and https go through libsoup on the main
 // context (MainContext), asynchronously, so no thread waits on the network. libsoup's session must stay on one

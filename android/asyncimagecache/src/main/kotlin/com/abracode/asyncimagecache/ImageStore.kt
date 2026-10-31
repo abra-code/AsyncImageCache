@@ -7,7 +7,9 @@
 // Two tiers:
 //   - in-memory: a MemoryCache of ready-to-draw variants (keyed by the full ImageRequest) + a MemoryCache of
 //     originals (raw transport bytes + natural pixel size + placeholder + animated flag, keyed by URL).
-//   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads.
+//   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads. Not
+//     for local file: and content: images, which are read from their source again; what the docs below say
+//     survives relaunch (pixel size, placeholder, animated flag) is then known only while the image is in memory.
 //
 // Thread safety comes from the MemoryCache/ConcurrentHashMap tiers plus a single lock guarding the in-flight
 // de-duplication table (the NSLock discipline is ported 1:1 - a plain lock + a list of completions, no clever

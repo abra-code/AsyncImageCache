@@ -2,7 +2,8 @@
 //
 // Exercises the async loader + two-tier cache end to end, using ONLY data: and file: URLs (no network is
 // assumed available). Covers: data: load + sync cache hit + main-thread completion; downscale to a target
-// width; disk persistence across a fresh ImageStore(name:); the transcode/format decisions; and removeAll.
+// width; disk persistence across a fresh ImageStore(name:); file: images kept out of the disk tier; the
+// transcode/format decisions; and removeAll.
 
 import XCTest
 import CoreGraphics
@@ -96,12 +97,10 @@ final class AsyncImageCacheTests: XCTestCase {
 
     func testDiskPersistenceAcrossFreshInstance() throws {
         let name = uniqueName()
-        let tempFile = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("aic-\(UUID().uuidString).png")
-        try pngData(width: 30, height: 20).write(to: tempFile)
-        let request = ImageRequest(url: tempFile)
+        let source = dataURL(png: pngData(width: 30, height: 20))
+        let request = ImageRequest(url: source)
 
-        // First instance loads from the file: URL and persists the original bytes to disk.
+        // First instance loads the data: URL and persists the original bytes to disk.
         let first = ImageStore(name: name)
         let e1 = expectation(description: "first load")
         first.load(request) { image in
@@ -112,27 +111,56 @@ final class AsyncImageCacheTests: XCTestCase {
 
         let diskFile = first.diskDirectoryURL.appendingPathComponent("", isDirectory: true)
         XCTAssertTrue(diskFile.path.contains("AsyncImageCache/\(name)"), "disk dir should live under Caches/AsyncImageCache/<name>")
-        XCTAssertTrue(first.diskFileExists(for: tempFile), "original bytes should be on disk under Caches")
-
-        // Delete the source file so any later success MUST come from the disk cache, not the file: path.
-        try FileManager.default.removeItem(at: tempFile)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: tempFile.path))
+        XCTAssertTrue(first.diskFileExists(for: source), "original bytes should be on disk under Caches")
 
         // A FRESH instance with the same name: memory is empty, so it serves from disk.
         let second = ImageStore(name: name)
         defer { second.removeAll() }
         XCTAssertNil(second.cachedImage(for: request), "fresh instance starts with an empty memory cache")
+        XCTAssertEqual(second.cachedPixelSize(for: source), CGSize(width: 30, height: 20), "known from disk, no decode")
+
+        // The data: URL could decode itself, so swap the cached bytes for a different picture: only a load
+        // served from disk sees it.
+        try pngData(width: 60, height: 20).write(to: DiskCache(name: name, byteLimit: 1 << 20).fileURL(for: source))
 
         let e2 = expectation(description: "second load from disk")
         second.load(request) { image in
-            XCTAssertNotNil(image, "fresh instance should serve the deleted file from disk")
+            XCTAssertNotNil(image, "fresh instance should serve the image")
             e2.fulfill()
         }
         wait(for: [e2], timeout: 5)
 
         // The raw original bytes (+ natural size) are reconstructed from disk - the cache is format-agnostic;
         // the transcode-for-copy logic now lives in RichText (tested in RichTextImageTranscodeTests).
-        XCTAssertNotNil(second.cachedOriginalBytes(for: tempFile), "original bytes should be reconstructed from disk")
+        XCTAssertEqual(second.cachedOriginalBytes(for: source)?.pixelSize, CGSize(width: 60, height: 20),
+                       "original bytes should be reconstructed from disk")
+    }
+
+    // A local file is its own copy: it is never kept in the disk tier, so after it is edited a fresh instance
+    // (a relaunch) shows the new picture, not the old one.
+    func testLocalFileImagesSkipTheDiskCache() throws {
+        let name = uniqueName()
+        let file = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(uniqueName()).png")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try pngData(width: 30, height: 20).write(to: file)
+
+        let first = ImageStore(name: name)
+        defer { first.removeAll() }
+        let e1 = expectation(description: "first load")
+        first.load(ImageRequest(url: file)) { image in
+            XCTAssertNotNil(image)
+            e1.fulfill()
+        }
+        wait(for: [e1], timeout: 5)
+        XCTAssertFalse(first.diskFileExists(for: file), "a local file is not copied into the disk cache")
+
+        try pngData(width: 40, height: 10).write(to: file)
+        let second = ImageStore(name: name)
+        XCTAssertNil(second.cachedPixelSize(for: file), "nothing about the old file was kept")
+        let e2 = expectation(description: "load after the edit")
+        second.load(ImageRequest(url: file)) { _ in e2.fulfill() }
+        wait(for: [e2], timeout: 5)
+        XCTAssertEqual(second.cachedPixelSize(for: file), CGSize(width: 40, height: 10), "the edited file is shown")
     }
 
     // The whole point of the design: after "relaunch" (fresh store, empty memory) the natural size is known
@@ -142,9 +170,7 @@ final class AsyncImageCacheTests: XCTestCase {
         let store = ImageStore(name: name)
         defer { store.removeAll() }
 
-        let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(uniqueName()).png")
-        try pngData(width: 123, height: 45).write(to: temp)
-        defer { try? FileManager.default.removeItem(at: temp) }
+        let temp = dataURL(png: pngData(width: 123, height: 45))
         let request = ImageRequest(url: temp)
 
         let loaded = expectation(description: "load")
@@ -152,9 +178,8 @@ final class AsyncImageCacheTests: XCTestCase {
         wait(for: [loaded], timeout: 5)
         XCTAssertEqual(store.cachedPixelSize(for: temp), CGSize(width: 123, height: 45))
 
-        // Delete the source, and use a FRESH instance (empty memory). It never loads/decodes the image, yet
-        // knows its size from the xattr on the cached bytes.
-        try FileManager.default.removeItem(at: temp)
+        // A FRESH instance (empty memory). It never loads/decodes the image, yet knows its size from the xattr
+        // on the cached bytes.
         let second = ImageStore(name: name)
         defer { second.removeAll() }
         XCTAssertNil(second.cachedImage(for: request), "fresh instance has no decoded variant in memory")
@@ -322,9 +347,7 @@ final class AsyncImageCacheTests: XCTestCase {
         let name = uniqueName()
         let store = ImageStore(name: name)
         defer { store.removeAll() }
-        let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(uniqueName()).png")
-        try pngData(width: 16, height: 16, opaque: true).write(to: temp)
-        defer { try? FileManager.default.removeItem(at: temp) }
+        let temp = dataURL(png: pngData(width: 16, height: 16, opaque: true))
         let request = ImageRequest(url: temp)
 
         let loaded = expectation(description: "load")
@@ -333,7 +356,6 @@ final class AsyncImageCacheTests: XCTestCase {
         let afterLoad = try XCTUnwrap(store.placeholder(for: temp))
         XCTAssertEqual(afterLoad.dimension, 6)
 
-        try FileManager.default.removeItem(at: temp)
         let second = ImageStore(name: name)
         defer { second.removeAll() }
         XCTAssertEqual(second.placeholder(for: temp), afterLoad, "the grid must round-trip via the xattr, no decode")
