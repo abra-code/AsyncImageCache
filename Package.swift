@@ -7,7 +7,8 @@
 //
 // On Linux the same AsyncImageCache module is built from the portable value types, over the
 // platform's own libraries (GTK 4, GLib and libsoup 3, found through pkg-config) and FoundationEssentials
-// only. The Apple engine files (CoreGraphics, ImageIO, CryptoKit, UIKit/AppKit, SwiftUI) are not compiled.
+// only: the Apple engine files (CoreGraphics, ImageIO, CryptoKit, UIKit/AppKit, SwiftUI) are not compiled,
+// and the Linux/ folders hold the Linux engine and its tests.
 //
 // See README.md for the API, design, and performance notes.
 
@@ -44,7 +45,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AsyncImageCacheTests",
-            dependencies: ["AsyncImageCache"],
+            dependencies: ["AsyncImageCache", "CAsyncImageCacheGtk"],
             exclude: appleOnlyTests
         ),
     ]
@@ -61,8 +62,9 @@ let package = Package(
         .library(name: "AsyncImageCache", targets: ["AsyncImageCache"]),
     ],
     targets: [
-        .target(name: "AsyncImageCache"),
-        .testTarget(name: "AsyncImageCacheTests", dependencies: ["AsyncImageCache"]),
+        // The Linux engine and its tests (in Linux/ folders) are not built here.
+        .target(name: "AsyncImageCache", exclude: ["Linux"]),
+        .testTarget(name: "AsyncImageCacheTests", dependencies: ["AsyncImageCache"], exclude: ["Linux"]),
     ]
 )
 #endif
