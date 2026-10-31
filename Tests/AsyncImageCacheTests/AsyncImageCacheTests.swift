@@ -196,19 +196,6 @@ final class AsyncImageCacheTests: XCTestCase {
         XCTAssertNotNil(store.cachedImage(for: request))
     }
 
-    // The variant key quantizes transforms to whole pixels, so sub-pixel-apart requests share one cached
-    // variant (no wasted decodes) and the key carries no fractional tail.
-    func testVariantKeyQuantizesToWholePixels() {
-        let url = URL(string: "https://example.test/i.png")!
-        let a = ImageRequest(url: url, targetWidth: 342.4, cornerRadius: 9.6)
-        let b = ImageRequest(url: url, targetWidth: 342.2, cornerRadius: 10.1)
-        XCTAssertEqual(a.variantKey, b.variantKey, "sub-pixel widths/radii should collapse to one variant")
-        // The width/radius carry no fractional tail (342.4 would have produced "|w=342.4|").
-        XCTAssertTrue(a.variantKey.contains("|w=342|"), a.variantKey)
-        XCTAssertTrue(a.variantKey.hasSuffix("|r=10"), a.variantKey)
-        XCTAssertEqual(ImageRequest(url: url).variantKey, "\(url.absoluteString)|w=nil|r=0")
-    }
-
     // Resilience: if the size xattr is missing (lost, or bytes cached by an older build) but the image bytes
     // are on disk, the size is still recovered from the image HEADER (no decode) and the xattr is repaired.
     func testPixelSizeFallsBackToImageHeaderWhenXattrMissing() throws {

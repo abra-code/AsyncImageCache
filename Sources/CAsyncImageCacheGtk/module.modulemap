@@ -1,0 +1,4 @@
+module CAsyncImageCacheGtk [system] {
+    header "CAsyncImageCacheGtk.h"
+    export *
+}

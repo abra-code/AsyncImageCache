@@ -4,7 +4,11 @@
 // UI-framework-free (no SwiftUI / UIKit / AppKit color type) so it can be computed off-main, packed into a
 // 4-byte extended attribute, and handed to any renderer; CachedImage turns it into a SwiftUI Color.
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
 import Foundation
+#endif
 
 public struct ImageColor: Sendable, Equatable {
     public let red: UInt8

@@ -4,7 +4,11 @@
 // loads. It is computed once off-main, persisted in an extended attribute, and rendered by upscaling the NxN
 // grid with bilinear interpolation (a soft gradient). Row 0 is the TOP of the image.
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
 import Foundation
+#endif
 
 /// Internal, tweakable configuration for the placeholder grid. NOT part of the public API - callers get a
 /// finished placeholder, not the knobs.

@@ -1,0 +1,4 @@
+module CAsyncImageCacheSoup [system] {
+    header "CAsyncImageCacheSoup.h"
+    export *
+}
