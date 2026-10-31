@@ -1,6 +1,6 @@
 # AsyncImageCache
 
-A small, reusable async image loading + caching component for iOS / macOS / visionOS. Shipped as a separate SPM library product so any consumer (RichText inline images, an
+A small, reusable async image loading + caching component for iOS / macOS / visionOS, and for GTK 4 programs on Linux. Shipped as a separate SPM library product so any consumer (RichText inline images, an
 ActionUIChat image bubble, a standalone image element) can depend on just this.
 
 Two design goals drive everything:
@@ -99,6 +99,23 @@ Fallback (resilience): should the xattr ever be missing while the bytes are stil
 the bytes were cached by a build that predates the attribute - the size is recovered from the image HEADER via
 `CGImageSource` (still no full decode), and the xattr is REPAIRED so the next read is back on the fast path. So
 a lost attribute costs one slightly-slower read, never a wrong box or a full decode.
+
+## Linux
+
+On Linux the same `AsyncImageCache` module builds over the platform's own libraries, found through pkg-config: GTK 4 (`gtk4`, which brings GLib and GdkPixbuf) and libsoup 3 (`libsoup-3.0`). It uses FoundationEssentials only, so a program that links it carries no ICU data. The oldest versions supported are GNOME 48's: GTK 4.18, GLib 2.84 and libsoup 3.6. https needs the GIO TLS backend, glib-networking, which GNOME desktops install.
+
+The API is the one above, with these differences:
+
+- `PlatformImage` is a class around a GdkTexture: `texture` (a `GdkTexture *` as an `OpaquePointer`), `pixelWidth` and `pixelHeight`. Show it with `gtk_picture_set_paintable`; the widget takes its own reference.
+- Sizes are `ImageSize` (`width`, `height`) where the Apple API returns CGSize, and `ImageRequest` takes its lengths as `ImageLength`, which is CGFloat on Apple platforms and Double on Linux.
+- Completions run on the thread of GLib's default main context, the GTK main loop, so any GTK program receives them however it drives libdispatch's main queue. Tests that wait for one iterate the context (`g_main_context_iteration`).
+- Decoding goes through GdkPixbuf's loaders (PNG, JPEG, GIF, TIFF, and others the system installs, such as WebP), with the EXIF orientation applied. A truncated image does not decode.
+- The disk cache lives in `$XDG_CACHE_HOME/AsyncImageCache/<name>/` (`~/.cache` by default), with the same file names as on Apple platforms. The size, animated flag and placeholder are kept in a `<file>.meta` file beside each image rather than in extended attributes, which Linux cache folders cannot be relied on to keep. The format is the Android port's.
+- http and https go through one libsoup session, which sends a User-Agent and allows six connections per host, as URLSession does.
+- Linux has no memory-pressure signal for a process, so the memory limits are the whole bound. `recommendedMemoryByteLimit()` uses the desktop range: 1/16 of RAM, between 256 MB and 1 GB.
+- `CachedImage` (the SwiftUI view) is Apple-only.
+
+Tests run with `swift test` on Linux too. The shared fixtures (`Fixtures/`) hold Linux to the same decoded values as Apple platforms and Android.
 
 ## Performance (dimensions of 100 cached ~1024x768 gradient JPEGs)
 
