@@ -42,4 +42,30 @@ final class PortableValueTests: XCTestCase {
         XCTAssertEqual(ImagePlaceholder(dimension: 0, cells: []).dominantColor,
                        ImageColor(red: 0, green: 0, blue: 0, alpha: 0))
     }
+
+    // Sizes can come from a document: Int() traps on what does not fit, on NaN and on an infinity.
+    func testAnImageRequestTakesAnySize() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.com/a.png"))
+        XCTAssertEqual(ImageRequest(url: url, targetWidth: 840.4).quantizedTargetWidth, 840)
+        XCTAssertEqual(ImageRequest(url: url, targetWidth: 0).quantizedTargetWidth, 1, "the smallest width, as before")
+        XCTAssertEqual(ImageRequest(url: url, targetWidth: -5).quantizedTargetWidth, 1)
+        XCTAssertEqual(ImageRequest(url: url, targetWidth: 1e300).quantizedTargetWidth, 1 << 24, "larger than any image: no limit")
+        XCTAssertEqual(ImageRequest(url: url, targetWidth: -1e300).quantizedTargetWidth, 1)
+        XCTAssertNil(ImageRequest(url: url, targetWidth: .infinity).quantizedTargetWidth, "no limit")
+        XCTAssertNil(ImageRequest(url: url, targetWidth: .nan).quantizedTargetWidth)
+        XCTAssertEqual(ImageRequest(url: url, cornerRadius: 12.4).quantizedCornerRadius, 12)
+        XCTAssertEqual(ImageRequest(url: url, cornerRadius: -3).quantizedCornerRadius, 0)
+        XCTAssertEqual(ImageRequest(url: url, cornerRadius: 1e300).quantizedCornerRadius, 1 << 24)
+        XCTAssertEqual(ImageRequest(url: url, cornerRadius: .nan).quantizedCornerRadius, 0)
+        XCTAssertEqual(ImageRequest(url: url, cornerRadius: .infinity).quantizedCornerRadius, 0)
+    }
+
+    // The store keeps waiting completions in a table keyed by the request, so a request must equal itself.
+    func testARequestWithNaNEqualsItself() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.com/a.png"))
+        for request in [ImageRequest(url: url, targetWidth: .nan), ImageRequest(url: url, cornerRadius: .nan)] {
+            XCTAssertEqual(request, request)
+            XCTAssertTrue(Set([request]).contains(request))
+        }
+    }
 }
