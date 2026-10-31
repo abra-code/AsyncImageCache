@@ -6,7 +6,9 @@
 //
 // Two tiers:
 //   - in-memory: an NSCache of ready-to-draw variants (keyed by the full ImageRequest) + an NSCache of
-//     originals (raw transport bytes + natural pixel size, keyed by URL).
+//     originals (raw transport bytes + natural pixel size, keyed by URL). A local file: image's keys also
+//     carry the file's modification time and size (fileVersion), so after the file is edited a lookup misses
+//     and the next load reads the new picture; the old entries age out.
 //   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads. Not
 //     for local file: images, which are read from their file again; what the docs below say survives relaunch
 //     (pixel size, placeholder, animated flag) is then known only while the image is in memory.
@@ -121,7 +123,7 @@ public final class ImageStore: @unchecked Sendable {
 
     /// The ready-to-draw variant for the exact request, if in memory. nil on a miss. Thread-safe.
     public func cachedImage(for request: ImageRequest) -> PlatformImage? {
-        variantCache.object(forKey: request.variantKey as NSString)
+        variantCache.object(forKey: Self.variantKey(request, Self.fileVersion(of: request.url)) as NSString)
     }
 
     /// The natural PIXEL size of a URL's image, if known WITHOUT decoding. Thread-safe. Lets a consumer
@@ -130,7 +132,7 @@ public final class ImageStore: @unchecked Sendable {
     /// getxattr, no decode) and memoizes it so repeated layout queries stay memory-fast.
     public func cachedPixelSize(for url: URL) -> CGSize? {
         let key = url.absoluteString as NSString
-        if let record = originalCache.object(forKey: key) {
+        if let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url)) as NSString) {
             return record.pixelSize
         }
         if let memo = pixelSizeMemo.object(forKey: key) {
@@ -149,7 +151,7 @@ public final class ImageStore: @unchecked Sendable {
     /// there is no decode fallback, since the grid needs the actual pixels.
     public func placeholder(for url: URL) -> ImagePlaceholder? {
         let key = url.absoluteString as NSString
-        if let record = originalCache.object(forKey: key) {
+        if let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url)) as NSString) {
             return record.placeholder
         }
         if let memo = placeholderMemo.object(forKey: key) {
@@ -182,7 +184,7 @@ public final class ImageStore: @unchecked Sendable {
     /// drives its own animated renderer (see the design notes) - this is the signal to decide whether to.
     public func isAnimated(for url: URL) -> Bool {
         let key = url.absoluteString as NSString
-        if let record = originalCache.object(forKey: key) {
+        if let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url)) as NSString) {
             return record.isAnimated
         }
         if let memo = animatedMemo.object(forKey: key) {
@@ -199,7 +201,7 @@ public final class ImageStore: @unchecked Sendable {
     /// consumers that need the source bytes (e.g. producing embeddable copy data) - the cache stays generic
     /// and does no format transcoding itself; the consumer decides how to encode.
     public func cachedOriginalBytes(for url: URL) -> (data: Data, pixelSize: CGSize)? {
-        guard let record = originalCache.object(forKey: url.absoluteString as NSString) else {
+        guard let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url)) as NSString) else {
             return nil
         }
         return (record.rawData, record.pixelSize)
@@ -210,7 +212,7 @@ public final class ImageStore: @unchecked Sendable {
     /// Resolve the ready-to-draw variant for `request`, calling `completion` on the MAIN thread. A memory hit
     /// delivers immediately; otherwise the byte fetch / decode / downscale / rounding all happen off-main.
     public func load(_ request: ImageRequest, completion: @escaping (PlatformImage?) -> Void) {
-        if let cached = variantCache.object(forKey: request.variantKey as NSString) {
+        if let cached = variantCache.object(forKey: Self.variantKey(request, Self.fileVersion(of: request.url)) as NSString) {
             deliver(cached, to: [completion])
             return
         }
@@ -264,17 +266,20 @@ public final class ImageStore: @unchecked Sendable {
     // scrolling and starve the rest of the app's queues.
     private func startProduction(_ request: ImageRequest) {
         let url = request.url
-        if let record = originalCache.object(forKey: url.absoluteString as NSString) {
-            finishProduction(request, bytes: record.rawData, writeDisk: false)
+        // Read before the bytes: if the file changes while it loads, the entries carry the older version and
+        // the next lookup misses, rather than the new version labeling the old bytes.
+        let version = Self.fileVersion(of: url)
+        if let record = originalCache.object(forKey: Self.originalKey(url, version) as NSString) {
+            finishProduction(request, bytes: record.rawData, writeDisk: false, version: version)
         } else if let disk = diskCache.data(for: url) {
-            finishProduction(request, bytes: disk, writeDisk: false)
+            finishProduction(request, bytes: disk, writeDisk: false, version: version)
         } else if let scheme = url.scheme?.lowercased(), scheme == "data" || scheme == "file" {
-            finishProduction(request, bytes: try? Data(contentsOf: url), writeDisk: true)
+            finishProduction(request, bytes: try? Data(contentsOf: url), writeDisk: true, version: version)
         } else {
             let task = Self.urlSession.dataTask(with: url) { [self] data, response, _ in
                 let bytes = Self.acceptableBody(data, response)
                 workQueue.async { [self] in
-                    finishProduction(request, bytes: bytes, writeDisk: true)
+                    finishProduction(request, bytes: bytes, writeDisk: true, version: version)
                 }
             }
             task.resume()
@@ -283,15 +288,15 @@ public final class ImageStore: @unchecked Sendable {
 
     // Decode, record the original (+ disk write for fresh bytes), build + cache the ready-to-draw variant,
     // then fire the pending completions. Runs on the work queue; nil bytes (fetch failed) delivers nil.
-    private func finishProduction(_ request: ImageRequest, bytes: Data?, writeDisk: Bool) {
+    private func finishProduction(_ request: ImageRequest, bytes: Data?, writeDisk: Bool, version: String) {
         var variant: PlatformImage?
         if let bytes, let raw = PlatformImage(data: bytes) {
             let decoded = ImageProcessing.orientedUp(raw)
-            recordOriginal(url: request.url, data: bytes, decoded: decoded, writeDisk: writeDisk)
+            recordOriginal(url: request.url, data: bytes, decoded: decoded, writeDisk: writeDisk, version: version)
             let built = ImageProcessing.variant(from: decoded,
                                                 targetWidth: request.quantizedTargetWidth.map { CGFloat($0) },
                                                 cornerRadius: CGFloat(request.quantizedCornerRadius))
-            variantCache.setObject(built, forKey: request.variantKey as NSString,
+            variantCache.setObject(built, forKey: Self.variantKey(request, version) as NSString,
                                    cost: ImageProcessing.memoryCost(of: built))
             variant = built
         }
@@ -303,14 +308,14 @@ public final class ImageStore: @unchecked Sendable {
 
     // Record the raw bytes + natural pixel size in memory and (for freshly fetched bytes) persist the
     // ORIGINAL transport bytes to disk. No transcoding here - that is a consumer concern.
-    private func recordOriginal(url: URL, data: Data, decoded: PlatformImage, writeDisk: Bool) {
+    private func recordOriginal(url: URL, data: Data, decoded: PlatformImage, writeDisk: Bool, version: String) {
         let pixelSize = ImageProcessing.pixelSize(of: decoded)
         let placeholder = ImageProcessing.placeholder(of: decoded)
         let isAnimated = ImageProcessing.isAnimated(data: data)
         // Cost = the transport bytes held resident (the compressed original); the size + grid are negligible.
         originalCache.setObject(OriginalRecord(rawData: data, pixelSize: pixelSize,
                                                placeholder: placeholder, isAnimated: isAnimated),
-                                forKey: url.absoluteString as NSString, cost: max(1, data.count))
+                                forKey: Self.originalKey(url, version) as NSString, cost: max(1, data.count))
         if writeDisk {
             diskCache.store(data, pixelSize: pixelSize, placeholder: placeholder, isAnimated: isAnimated, for: url)
         } else if let placeholder {
@@ -318,6 +323,32 @@ public final class ImageStore: @unchecked Sendable {
             // attribute was stripped) never pass through store() again, so repair the xattr here.
             diskCache.storePlaceholderIfMissing(placeholder, for: url)
         }
+    }
+
+    // MARK: - Memory keys
+
+    // A local file's modification time, size and inode, appended to its memory keys so an edited file misses the
+    // old entries (the inode catches editors that save by writing a new file and renaming it); "" for every other
+    // scheme, and for a file that is gone, whose load fails anyway. One stat per lookup. A same-size rewrite in
+    // place within the file system's timestamp resolution is missed. A space cannot occur in an absolute URL
+    // string, so the suffix never collides with a real URL.
+    static func fileVersion(of url: URL) -> String {
+        guard url.isFileURL else {
+            return ""
+        }
+        var info = stat()
+        guard stat(url.path, &info) == 0 else {
+            return ""
+        }
+        return " \(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_size) \(info.st_ino)"
+    }
+
+    static func originalKey(_ url: URL, _ version: String) -> String {
+        url.absoluteString + version
+    }
+
+    static func variantKey(_ request: ImageRequest, _ version: String) -> String {
+        request.variantKey + version
     }
 
     // The response body worth caching, or nil to reject it. A non-2xx HTTP status is rejected so an error

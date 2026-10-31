@@ -75,7 +75,8 @@ ImageStore.shared.load(ImageRequest(url: url, targetWidth: 840, cornerRadius: 10
     with a soft byte budget enforced by an LRU-ish trim (oldest-by-mtime). Survives relaunch; the OS may
     still evict Caches (a miss just falls through to the network). Local `file:` images (and `content:` on
     Android) are never copied here: the file is its own copy, and a copy would go on showing the old picture
-    after the file is edited.
+    after the file is edited. In memory, a local file's entries are keyed on its modification time and size
+    too, so the next load after an edit reads the new picture (the store does not watch files).
 - Byte resolution order (off-main): in-memory originals -> disk -> source (`data:`/`file:` decode locally,
   `http(s)` via `URLSession`).
 - Variant key quantization: `targetWidth` / `cornerRadius` are `CGFloat` in the API (caller convenience) but

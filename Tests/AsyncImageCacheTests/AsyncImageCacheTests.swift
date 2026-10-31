@@ -136,6 +136,35 @@ final class AsyncImageCacheTests: XCTestCase {
                        "original bytes should be reconstructed from disk")
     }
 
+    // In the same run: a local file's memory entries are keyed on its modification time and size, so after an
+    // edit the old picture is a miss and the next load reads the new one.
+    func testAnEditedLocalFileShowsItsNewPictureInTheSameRun() throws {
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let file = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(uniqueName()).png")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try pngData(width: 30, height: 20).write(to: file)
+        let request = ImageRequest(url: file)
+
+        let e1 = expectation(description: "first load")
+        store.load(request) { _ in e1.fulfill() }
+        wait(for: [e1], timeout: 5)
+        XCTAssertNotNil(store.cachedImage(for: request))
+        XCTAssertEqual(store.cachedPixelSize(for: file), CGSize(width: 30, height: 20))
+
+        try pngData(width: 40, height: 10).write(to: file)
+        // A different modification time for sure, not only a different size.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(10)],
+                                              ofItemAtPath: file.path)
+        XCTAssertNil(store.cachedImage(for: request), "the old picture is not shown for the edited file")
+        XCTAssertNil(store.cachedPixelSize(for: file))
+        let e2 = expectation(description: "load after the edit")
+        store.load(request) { _ in e2.fulfill() }
+        wait(for: [e2], timeout: 5)
+        XCTAssertEqual(store.cachedPixelSize(for: file), CGSize(width: 40, height: 10), "the edited file is shown")
+        XCTAssertEqual(store.cachedOriginalBytes(for: file)?.pixelSize, CGSize(width: 40, height: 10))
+    }
+
     // A local file is its own copy: it is never kept in the disk tier, so after it is edited a fresh instance
     // (a relaunch) shows the new picture, not the old one.
     func testLocalFileImagesSkipTheDiskCache() throws {

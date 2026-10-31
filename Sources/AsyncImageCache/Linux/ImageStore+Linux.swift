@@ -7,7 +7,9 @@
 //
 // Two tiers:
 //   - in-memory: MemoryCache maps of ready-to-draw variants (keyed by the full ImageRequest) and of originals
-//     (raw transport bytes + natural pixel size, keyed by URL).
+//     (raw transport bytes + natural pixel size, keyed by URL). A local file: image's keys also carry the
+//     file's modification time and size (fileVersion), so after the file is edited a lookup misses and the next
+//     load reads the new picture; the old entries age out.
 //   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads. Not
 //     for local file: images, which are read from their file again; what the docs below say survives relaunch
 //     (pixel size, placeholder, animated flag) is then known only while the image is in memory.
@@ -89,14 +91,14 @@ public final class ImageStore: @unchecked Sendable {
 
     /// The ready-to-draw variant for the exact request, if in memory. nil on a miss. Thread-safe.
     public func cachedImage(for request: ImageRequest) -> PlatformImage? {
-        variantCache.object(forKey: request.variantKey)
+        variantCache.object(forKey: Self.variantKey(request, Self.fileVersion(of: request.url)))
     }
 
     /// The natural PIXEL size of a URL's image, if known WITHOUT decoding. Thread-safe. Survives relaunch: the
     /// size rode along with the on-disk bytes in their sidecar, so this reads it and memoizes it.
     public func cachedPixelSize(for url: URL) -> ImageSize? {
         let key = url.absoluteString
-        if let record = originalCache.object(forKey: key) {
+        if let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url))) {
             return record.pixelSize
         }
         if let memo = pixelSizeMemo.object(forKey: key) {
@@ -113,7 +115,7 @@ public final class ImageStore: @unchecked Sendable {
     /// and, like the size, survives relaunch.
     public func placeholder(for url: URL) -> ImagePlaceholder? {
         let key = url.absoluteString
-        if let record = originalCache.object(forKey: key) {
+        if let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url))) {
             return record.placeholder
         }
         if let memo = placeholderMemo.object(forKey: key) {
@@ -139,7 +141,7 @@ public final class ImageStore: @unchecked Sendable {
     /// unknown (the flag is known only AFTER the image has passed through the cache once).
     public func isAnimated(for url: URL) -> Bool {
         let key = url.absoluteString
-        if let record = originalCache.object(forKey: key) {
+        if let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url))) {
             return record.isAnimated
         }
         if let memo = animatedMemo.object(forKey: key) {
@@ -154,7 +156,7 @@ public final class ImageStore: @unchecked Sendable {
 
     /// The ORIGINAL transport bytes + natural pixel size for a loaded URL, or nil if not in memory.
     public func cachedOriginalBytes(for url: URL) -> (data: Data, pixelSize: ImageSize)? {
-        guard let record = originalCache.object(forKey: url.absoluteString) else {
+        guard let record = originalCache.object(forKey: Self.originalKey(url, Self.fileVersion(of: url))) else {
             return nil
         }
         return (record.rawData, record.pixelSize)
@@ -165,7 +167,7 @@ public final class ImageStore: @unchecked Sendable {
     /// Resolve the ready-to-draw variant for `request`, calling `completion` on the MAIN thread (the GLib main
     /// context's), always after this call returns. The byte fetch / decode / downscale / rounding happen off-main.
     public func load(_ request: ImageRequest, completion: @escaping (PlatformImage?) -> Void) {
-        if let cached = variantCache.object(forKey: request.variantKey) {
+        if let cached = variantCache.object(forKey: Self.variantKey(request, Self.fileVersion(of: request.url))) {
             deliver(cached, to: [UncheckedSendableBox(completion)])
             return
         }
@@ -216,40 +218,45 @@ public final class ImageStore: @unchecked Sendable {
     // Resolve original bytes (memory -> disk -> source) and hand them to finishProduction. Runs on the work queue.
     private func startProduction(_ request: ImageRequest) {
         let url = request.url
-        if let record = originalCache.object(forKey: url.absoluteString) {
-            finishProduction(request, bytes: record.rawData, writeDisk: false)
+        // Read before the bytes: if the file changes while it loads, the entries carry the older version and the
+        // next lookup misses, rather than the new version labeling the old bytes.
+        let version = Self.fileVersion(of: url)
+        if let record = originalCache.object(forKey: Self.originalKey(url, version)) {
+            finishProduction(request, bytes: record.rawData, writeDisk: false, version: version)
             return
         }
         if let disk = diskCache.data(for: url) {
-            finishProduction(request, bytes: disk, writeDisk: false)
+            finishProduction(request, bytes: disk, writeDisk: false, version: version)
             return
         }
         switch url.scheme?.lowercased() {
         case "file":
-            finishProduction(request, bytes: url.isFileURL ? try? Data(contentsOf: url) : nil, writeDisk: true)
+            finishProduction(request, bytes: url.isFileURL ? try? Data(contentsOf: url) : nil, writeDisk: true,
+                             version: version)
         case "data":
-            finishProduction(request, bytes: Self.decodeDataURL(url.absoluteString), writeDisk: true)
+            finishProduction(request, bytes: Self.decodeDataURL(url.absoluteString), writeDisk: true, version: version)
         case "http", "https":
             HTTPLoader.fetch(url.absoluteString) { [self] bytes in
                 workQueue.async { [self] in
-                    finishProduction(request, bytes: bytes, writeDisk: true)
+                    finishProduction(request, bytes: bytes, writeDisk: true, version: version)
                 }
             }
         default:
-            finishProduction(request, bytes: nil, writeDisk: false)
+            finishProduction(request, bytes: nil, writeDisk: false, version: version)
         }
     }
 
     // Decode, record the original (+ disk write for fresh bytes), build + cache the ready-to-draw variant,
     // then fire the pending completions. Runs on the work queue; nil bytes (fetch failed) delivers nil.
-    private func finishProduction(_ request: ImageRequest, bytes: Data?, writeDisk: Bool) {
+    private func finishProduction(_ request: ImageRequest, bytes: Data?, writeDisk: Bool, version: String) {
         var variant: PlatformImage?
         if let bytes, let decoded = ImageProcessing.decode(bytes) {
-            recordOriginal(url: request.url, data: bytes, decoded: decoded, writeDisk: writeDisk)
+            recordOriginal(url: request.url, data: bytes, decoded: decoded, writeDisk: writeDisk, version: version)
             if let built = ImageProcessing.variant(from: decoded,
                                                    targetWidth: request.quantizedTargetWidth.map { ImageLength($0) },
                                                    cornerRadius: ImageLength(request.quantizedCornerRadius)) {
-                variantCache.setObject(built, forKey: request.variantKey, cost: ImageProcessing.memoryCost(of: built))
+                variantCache.setObject(built, forKey: Self.variantKey(request, version),
+                                       cost: ImageProcessing.memoryCost(of: built))
                 variant = built
             }
         }
@@ -259,13 +266,13 @@ public final class ImageStore: @unchecked Sendable {
 
     // Record the raw bytes + natural pixel size in memory and (for freshly fetched bytes) persist the ORIGINAL
     // transport bytes to disk.
-    private func recordOriginal(url: URL, data: Data, decoded: DecodedImage, writeDisk: Bool) {
+    private func recordOriginal(url: URL, data: Data, decoded: DecodedImage, writeDisk: Bool, version: String) {
         let pixelSize = ImageProcessing.pixelSize(of: decoded)
         let placeholder = ImageProcessing.placeholder(of: decoded)
         let isAnimated = ImageProcessing.isAnimated(data: data)
         originalCache.setObject(OriginalRecord(rawData: data, pixelSize: pixelSize,
                                                placeholder: placeholder, isAnimated: isAnimated),
-                                forKey: url.absoluteString, cost: max(1, data.count))
+                                forKey: Self.originalKey(url, version), cost: max(1, data.count))
         if writeDisk {
             diskCache.store(data, pixelSize: pixelSize, placeholder: placeholder, isAnimated: isAnimated, for: url)
         } else if let placeholder {
@@ -301,6 +308,32 @@ public final class ImageStore: @unchecked Sendable {
                 completion.value(image)
             }
         }
+    }
+
+    // MARK: - Memory keys
+
+    // A local file's modification time, size and inode, appended to its memory keys so an edited file misses the
+    // old entries (the inode catches editors that save by writing a new file and renaming it); "" for every other
+    // scheme, and for a file that is gone, whose load fails anyway. One stat per lookup. A same-size rewrite in
+    // place within the file system's timestamp resolution is missed. A space cannot occur in an absolute URL
+    // string, so the suffix never collides with a real URL.
+    static func fileVersion(of url: URL) -> String {
+        guard url.isFileURL else {
+            return ""
+        }
+        var info = stat()
+        guard stat(url.path, &info) == 0 else {
+            return ""
+        }
+        return " \(info.st_mtim.tv_sec).\(info.st_mtim.tv_nsec) \(info.st_size) \(info.st_ino)"
+    }
+
+    static func originalKey(_ url: URL, _ version: String) -> String {
+        url.absoluteString + version
+    }
+
+    static func variantKey(_ request: ImageRequest, _ version: String) -> String {
+        request.variantKey + version
     }
 }
 

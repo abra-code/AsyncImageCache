@@ -86,6 +86,29 @@ final class LinuxImageStoreTests: XCTestCase {
         XCTAssertEqual([image.pixelWidth, image.pixelHeight], [15, 5])
     }
 
+    // In the same run: a local file's memory entries are keyed on its modification time and size, so after an
+    // edit the old picture is a miss and the next load reads the new one.
+    func testAnEditedLocalFileShowsItsNewPictureInTheSameRun() throws {
+        let store = makeStore()
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("\(uniqueName()).png")
+        try pngData(width: 30, height: 20).write(to: file)
+        defer {
+            try? FileManager.default.removeItem(at: file)
+        }
+        let request = ImageRequest(url: file)
+        XCTAssertNotNil(load(store, request))
+        XCTAssertNotNil(store.cachedImage(for: request))
+
+        try pngData(width: 40, height: 10).write(to: file)
+        // A different modification time for sure, not only a different size.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(10)],
+                                              ofItemAtPath: file.path)
+        XCTAssertNil(store.cachedImage(for: request), "the old picture is not shown for the edited file")
+        XCTAssertNil(store.cachedPixelSize(for: file))
+        let image = try XCTUnwrap(load(store, request))
+        XCTAssertEqual([image.pixelWidth, image.pixelHeight], [40, 10], "the edited file is shown")
+    }
+
     // A local file is its own copy: it is never kept in the disk tier, so after it is edited a new store (a
     // relaunch) shows the new picture, not the old one.
     func testLocalFileImagesSkipTheDiskCache() throws {

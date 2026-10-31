@@ -6,7 +6,9 @@
 //
 // Two tiers:
 //   - in-memory: a MemoryCache of ready-to-draw variants (keyed by the full ImageRequest) + a MemoryCache of
-//     originals (raw transport bytes + natural pixel size + placeholder + animated flag, keyed by URL).
+//     originals (raw transport bytes + natural pixel size + placeholder + animated flag, keyed by URL). A local
+//     file: image's keys also carry the file's modification time and size (fileVersion), so after the file is
+//     edited a lookup misses and the next load reads the new picture; the old entries age out.
 //   - on-disk: the ORIGINAL transport bytes (DiskCache), which survive relaunch and enable offline reads. Not
 //     for local file: and content: images, which are read from their source again; what the docs below say
 //     survives relaunch (pixel size, placeholder, animated flag) is then known only while the image is in memory.
@@ -127,7 +129,8 @@ class ImageStore(
     // MARK: - Synchronous lookups
 
     /** The ready-to-draw variant for the exact request, if in memory. null on a miss. Thread-safe. */
-    fun cachedImage(request: ImageRequest): Bitmap? = variantCache.get(request.variantKey)
+    fun cachedImage(request: ImageRequest): Bitmap? =
+        variantCache.get(variantKey(request, fileVersion(request.url)))
 
     /**
      * The natural PIXEL size of a URL's image, if known WITHOUT decoding. Thread-safe. Lets a consumer reserve
@@ -135,7 +138,7 @@ class ImageStore(
      * along with the on-disk bytes in the sidecar meta, so this reads it (no decode) and memoizes it.
      */
     fun cachedPixelSize(url: String): Size? {
-        originalCache.get(url)?.let { return it.pixelSize }
+        originalCache.get(originalKey(url, fileVersion(url)))?.let { return it.pixelSize }
         pixelSizeMemo[url]?.let { return it }
         val size = diskCache.pixelSize(url) ?: return null
         pixelSizeMemo[url] = size
@@ -148,7 +151,7 @@ class ImageStore(
      * (the caller then uses a neutral fallback); there is no decode fallback, since the grid needs real pixels.
      */
     fun placeholder(url: String): ImagePlaceholder? {
-        originalCache.get(url)?.let { return it.placeholder }
+        originalCache.get(originalKey(url, fileVersion(url)))?.let { return it.placeholder }
         placeholderMemo[url]?.let { return it }
         val placeholder = diskCache.placeholder(url) ?: return null
         placeholderMemo[url] = placeholder
@@ -173,7 +176,7 @@ class ImageStore(
      * cachedOriginalBytes(url) and drives its own animated renderer.
      */
     fun isAnimated(url: String): Boolean {
-        originalCache.get(url)?.let { return it.isAnimated }
+        originalCache.get(originalKey(url, fileVersion(url)))?.let { return it.isAnimated }
         animatedMemo[url]?.let { return it }
         val animated = diskCache.isAnimated(url) ?: return false
         animatedMemo[url] = animated
@@ -185,7 +188,7 @@ class ImageStore(
      * that need the source bytes (e.g. driving GIF playback); the cache does no format transcoding itself.
      */
     fun cachedOriginalBytes(url: String): OriginalBytes? {
-        val record = originalCache.get(url) ?: return null
+        val record = originalCache.get(originalKey(url, fileVersion(url))) ?: return null
         return OriginalBytes(record.rawData, record.pixelSize)
     }
 
@@ -196,7 +199,7 @@ class ImageStore(
      * delivers immediately; otherwise the byte fetch / decode / downscale / rounding all happen off-main.
      */
     fun load(request: ImageRequest, completion: (Bitmap?) -> Unit) {
-        variantCache.get(request.variantKey)?.let {
+        variantCache.get(variantKey(request, fileVersion(request.url)))?.let {
             deliver(it, listOf(completion))
             return
         }
@@ -252,13 +255,16 @@ class ImageStore(
     // on Dispatchers.Default. Fresh bytes are written to disk; cache hits are not.
     private suspend fun startProduction(request: ImageRequest) {
         val url = request.url
-        originalCache.get(url)?.let {
-            finishProduction(request, it.rawData, writeDisk = false)
+        // Read before the bytes: if the file changes while it loads, the entries carry the older version and the
+        // next lookup misses, rather than the new version labeling the old bytes.
+        val version = withContext(Dispatchers.IO) { fileVersion(url) }
+        originalCache.get(originalKey(url, version))?.let {
+            finishProduction(request, it.rawData, writeDisk = false, version = version)
             return
         }
         val disk = withContext(Dispatchers.IO) { diskCache.data(url) }
         if (disk != null) {
-            finishProduction(request, disk, writeDisk = false)
+            finishProduction(request, disk, writeDisk = false, version = version)
             return
         }
         val scheme = try {
@@ -272,24 +278,29 @@ class ImageStore(
                 else -> fetchRemote(url)
             }
         }
-        finishProduction(request, bytes, writeDisk = true)
+        finishProduction(request, bytes, writeDisk = true, version = version)
     }
 
     // Decode, record the original (+ disk write for fresh bytes), build + cache the ready-to-draw variant, then
     // fire the pending completions. nil bytes (fetch failed) delivers nil.
-    private suspend fun finishProduction(request: ImageRequest, bytes: ByteArray?, writeDisk: Boolean) {
+    private suspend fun finishProduction(
+        request: ImageRequest,
+        bytes: ByteArray?,
+        writeDisk: Boolean,
+        version: String,
+    ) {
         var variant: Bitmap? = null
         try {
             if (bytes != null) {
                 val decoded = ImageProcessing.decode(bytes)
                 if (decoded != null) {
-                    recordOriginal(request.url, bytes, decoded, writeDisk)
+                    recordOriginal(request.url, bytes, decoded, writeDisk, version)
                     val built = ImageProcessing.variant(
                         source = decoded,
                         targetWidth = request.quantizedTargetWidth?.toFloat(),
                         cornerRadius = request.quantizedCornerRadius.toFloat(),
                     )
-                    variantCache.put(request.variantKey, built)
+                    variantCache.put(variantKey(request, version), built)
                     variant = built
                 }
             }
@@ -308,11 +319,17 @@ class ImageStore(
 
     // Record the raw bytes + natural size + placeholder + animated flag in memory and (for freshly fetched
     // bytes) persist the ORIGINAL transport bytes to disk. No transcoding here - that is a consumer concern.
-    private suspend fun recordOriginal(url: String, data: ByteArray, decoded: Bitmap, writeDisk: Boolean) {
+    private suspend fun recordOriginal(
+        url: String,
+        data: ByteArray,
+        decoded: Bitmap,
+        writeDisk: Boolean,
+        version: String,
+    ) {
         val pixelSize = ImageProcessing.pixelSize(decoded)
         val placeholder = ImageProcessing.placeholder(decoded)
         val isAnimated = ImageProcessing.isAnimated(data)
-        originalCache.put(url, OriginalEntry(data, pixelSize, placeholder, isAnimated))
+        originalCache.put(originalKey(url, version), OriginalEntry(data, pixelSize, placeholder, isAnimated))
         if (writeDisk) {
             withContext(Dispatchers.IO) {
                 diskCache.store(data, pixelSize, placeholder, isAnimated, url)
@@ -399,6 +416,27 @@ class ImageStore(
     companion object {
         const val DEFAULT_MEMORY_COUNT_LIMIT = 150
         const val DEFAULT_DISK_BYTE_LIMIT = 200L * 1024 * 1024
+
+        // A local file's modification time and size, appended to its memory keys so an edited file misses the old
+        // entries; "" for every other scheme, content: included (no cheap way to ask a provider whether its data
+        // changed), and for a file that is gone. One stat per lookup. A same-size rewrite within the file system's
+        // timestamp resolution is missed. A collision would need a missing file's URL that spells another file's
+        // versioned key, which is harmless.
+        internal fun fileVersion(url: String): String {
+            if (!url.startsWith("file:", ignoreCase = true)) return ""
+            val path = try {
+                Uri.parse(url).path
+            } catch (t: Throwable) {
+                null
+            } ?: return ""
+            val file = File(path)
+            val modified = file.lastModified()
+            return if (modified == 0L) "" else " $modified ${file.length()}"
+        }
+
+        internal fun originalKey(url: String, version: String): String = url + version
+
+        internal fun variantKey(request: ImageRequest, version: String): String = request.variantKey + version
 
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 30_000

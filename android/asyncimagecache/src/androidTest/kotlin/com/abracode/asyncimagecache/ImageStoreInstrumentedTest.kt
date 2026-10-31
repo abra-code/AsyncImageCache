@@ -139,6 +139,30 @@ class ImageStoreInstrumentedTest {
         }
     }
 
+    // In the same run: a local file's memory entries are keyed on its modification time and size, so after an
+    // edit the old picture is a miss and the next load reads the new one.
+    @Test fun anEditedLocalFileShowsItsNewPictureInTheSameRun() {
+        val tempFile = File(context.cacheDir, "aic-${UUID.randomUUID()}.png").apply { writeBytes(pngBytes(30, 20)) }
+        val fileUrl = tempFile.toURI().toString()   // file:/...
+        val request = ImageRequest(fileUrl)
+        val store = ImageStore(context, uniqueName())
+        try {
+            assertNotNull(loadBlocking(store, request))
+            assertNotNull(store.cachedImage(request))
+
+            tempFile.writeBytes(pngBytes(40, 10))
+            // A different modification time for sure, not only a different size.
+            tempFile.setLastModified(System.currentTimeMillis() + 10_000)
+            assertNull("the old picture is not shown for the edited file", store.cachedImage(request))
+            assertNull(store.cachedPixelSize(fileUrl))
+            assertNotNull(loadBlocking(store, request))
+            assertEquals("the edited file is shown", Size(40, 10), store.cachedPixelSize(fileUrl))
+        } finally {
+            store.removeAll()
+            tempFile.delete()
+        }
+    }
+
     @Test fun pixelSizeSurvivesRelaunchWithoutDecoding() {
         val name = uniqueName()
         val url = dataUrl(pngBytes(123, 45))
