@@ -70,10 +70,16 @@ final class PortableValueTests: XCTestCase {
     }
 
     func testImageSizeLimits() {
-        XCTAssertTrue(ImageLimits.accepts(width: 12000, height: 9000), "a large photo")
+        XCTAssertTrue(ImageLimits.accepts(width: 8064, height: 6048), "a 48 megapixel photo")
         XCTAssertTrue(ImageLimits.accepts(width: 65536, height: 1), "the longest side")
-        XCTAssertTrue(ImageLimits.accepts(width: 16384, height: 16384), "the most pixels: about 1 GB decoded")
-        XCTAssertFalse(ImageLimits.accepts(width: 16385, height: 16384))
+        let side = ImageLimits.mostPixels.squareRoot()
+        XCTAssertTrue(ImageLimits.accepts(width: side, height: side), "the most pixels")
+        XCTAssertFalse(ImageLimits.accepts(width: side + 1, height: side))
+        #if os(iOS)
+        XCTAssertEqual(side, 8192, "iOS ends an app that takes too much memory")
+        #else
+        XCTAssertEqual(side, 16384)
+        #endif
         XCTAssertFalse(ImageLimits.accepts(width: 65537, height: 1))
         XCTAssertFalse(ImageLimits.accepts(width: 1, height: 65537))
         XCTAssertFalse(ImageLimits.accepts(width: 1e300, height: 1e300), "the product is an infinity")

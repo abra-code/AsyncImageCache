@@ -105,7 +105,7 @@ a lost attribute costs one slightly-slower read, never a wrong box or a full dec
 
 ## Image size limit
 
-A file names its own size, and an image can come from anywhere, so an image declaring more than 65,536 pixels on a side, or more than 268 megapixels (16384 x 16384), is refused before anything is rasterized: it fails to load like a corrupt file, and nothing is cached. That is well past any photo or panorama. Vector images (SVG, PDF on macOS) count at the size they declare, and rasterize at that size. Such an image still costs 2 to 4 GB at the peak of loading it.
+A file names its own size, and an image can come from anywhere, so an image declaring more than 65,536 pixels on a side, or more than 268 megapixels (16384 x 16384), or 64 megapixels (8192 x 8192) on iOS, where the system ends an app that takes too much memory, is refused before anything is rasterized: it fails to load like a corrupt file, and nothing is cached. That is well past any photo or panorama. Vector images (SVG, PDF on macOS) count at the size they declare, and rasterize at that size. An image at the limit costs two to four times its decoded size at the peak of loading it: 2 to 4 GB, or up to about 1 GB on iOS.
 
 ## Linux
 

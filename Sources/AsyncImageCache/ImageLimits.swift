@@ -8,8 +8,15 @@
 enum ImageLimits {
     /// The longest side, in pixels.
     static let longestSide: ImageLength = 65536
+    #if os(iOS)
+    /// The most pixels: 8192 x 8192, about 256 MB decoded, and two to four times that at the peak of loading one. iOS
+    /// ends an app that takes too much memory, so an image cannot be allowed the gigabytes the other platforms can
+    /// give one. Past a 48 megapixel iPhone photo.
+    static let mostPixels: ImageLength = 67_108_864
+    #else
     /// The most pixels: 16384 x 16384, about 1 GB decoded, and 2 to 4 GB at the peak of loading one.
     static let mostPixels: ImageLength = 268_435_456
+    #endif
 
     /// Whether an image declaring this size may be decoded. A size of zero is not refused here: whether such an image
     /// is one is for the decoder to judge.

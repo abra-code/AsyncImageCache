@@ -760,6 +760,23 @@ final class AsyncImageCacheTests: XCTestCase {
     }
     #endif
 
+    #if os(iOS)
+    // iOS has the lower limit: a real bitmap past it is refused, and a 48 megapixel photo's size is not.
+    func testIOSRefusesABitmapPastItsLowerLimit() throws {
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let finished = expectation(description: "completion")
+        var result: PlatformImage?
+        store.load(ImageRequest(url: dataURL(png: pngData(width: 8200, height: 8200)))) { image in
+            result = image
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 30)
+        XCTAssertNil(result, "past 8192 x 8192")
+        XCTAssertTrue(ImageLimits.accepts(width: 8064, height: 6048))
+    }
+    #endif
+
     func testAnImageAtAnOrdinarySizeStillLoads() throws {
         let store = ImageStore(name: uniqueName())
         defer { store.removeAll() }
