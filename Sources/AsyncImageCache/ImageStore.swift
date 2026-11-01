@@ -290,7 +290,8 @@ public final class ImageStore: @unchecked Sendable {
     // then fire the pending completions. Runs on the work queue; nil bytes (fetch failed) delivers nil.
     private func finishProduction(_ request: ImageRequest, bytes: Data?, writeDisk: Bool, version: String) {
         var variant: PlatformImage?
-        if let bytes, let raw = PlatformImage(data: bytes) {
+        // PlatformImage(data:) rasterizes nothing, so the size a file declares is checked before anything does.
+        if let bytes, let raw = PlatformImage(data: bytes), ImageProcessing.isWithinLimits(raw) {
             let decoded = ImageProcessing.orientedUp(raw)
             recordOriginal(url: request.url, data: bytes, decoded: decoded, writeDisk: writeDisk, version: version)
             let built = ImageProcessing.variant(from: decoded,

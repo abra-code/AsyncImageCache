@@ -708,4 +708,72 @@ final class AsyncImageCacheTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Declared sizes
+
+    // A file names its own size. NSImage takes SVG and PDF, whose size is any number the file says: rasterizing those
+    // trapped, raised an exception Swift cannot catch, or ran for many seconds. Each must simply fail to load.
+    private func assertRefused(_ text: String, type: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let url = try XCTUnwrap(URL(string: "data:\(type);base64,\(Data(text.utf8).base64EncodedString())"))
+        let finished = expectation(description: "completion")
+        var result: PlatformImage?
+        store.load(ImageRequest(url: url)) { image in
+            result = image
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
+        XCTAssertNil(result, "refused", file: file, line: line)
+        XCTAssertFalse(store.diskFileExists(for: url), "nothing written", file: file, line: line)
+        XCTAssertNil(store.cachedOriginalBytes(for: url), "nothing recorded", file: file, line: line)
+    }
+
+    func testAnSVGDeclaringAHugeSizeIsRefused() throws {
+        for size in [("3000000000", "1"), ("1e300", "1e300"), ("4294967296", "4294967296"), ("100000", "100000")] {
+            try assertRefused("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"\(size.0)\" height=\"\(size.1)\"/>",
+                              type: "image/svg+xml")
+        }
+    }
+
+    func testAPDFDeclaringAHugePageIsRefused() throws {
+        let pdf = """
+            %PDF-1.4
+            1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+            2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
+            3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100000000000 100000000000]>>endobj
+            trailer<</Root 1 0 R>>
+            %%EOF
+            """
+        try assertRefused(pdf, type: "application/pdf")
+    }
+
+    #if canImport(AppKit) && !canImport(UIKit)
+    // Left to itself AppKit rasterizes a vector image at the display's scale, four times the pixels the limit checked
+    // on a Retina screen. (On a 1x display this passes either way.)
+    func testAVectorImageRasterizesAtTheSizeItDeclares() throws {
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"10\"/>"
+        let image = try XCTUnwrap(NSImage(data: Data(svg.utf8)))
+        let raster = try XCTUnwrap(ImageProcessing.cgImage(from: image))
+        XCTAssertEqual(raster.width, 20)
+        XCTAssertEqual(raster.height, 10)
+    }
+    #endif
+
+    func testAnImageAtAnOrdinarySizeStillLoads() throws {
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"10\"><rect width=\"20\" height=\"10\"/></svg>"
+        let url = try XCTUnwrap(URL(string: "data:image/svg+xml;base64,\(Data(svg.utf8).base64EncodedString())"))
+        let finished = expectation(description: "completion")
+        var result: PlatformImage?
+        store.load(ImageRequest(url: url)) { image in
+            result = image
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
+        #if canImport(AppKit) && !canImport(UIKit)
+        XCTAssertNotNil(result, "a vector image of a normal size is not refused")
+        #endif
+    }
 }

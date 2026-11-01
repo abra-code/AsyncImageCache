@@ -43,6 +43,17 @@ enum ImageProcessing {
         return data.withUnsafeBytes { AnimatedImageDetector.isAnimated($0) }
     }
 
+    // Most loaders report the size the file declares before they allocate any pixels, and a size of 0 makes them give
+    // up. Some decode first (ICNS, QTIF, HEIF) or hand back a pixbuf anyway (SVG), so the flag decides, not the loader.
+    private static let sizePrepared: @convention(c) (UnsafeMutablePointer<GdkPixbufLoader>?, gint, gint, gpointer?) -> Void = {
+        loader, width, height, refused in
+        guard !ImageLimits.accepts(width: ImageLength(width), height: ImageLength(height)) else {
+            return
+        }
+        refused?.assumingMemoryBound(to: Bool.self).pointee = true
+        gdk_pixbuf_loader_set_size(loader, 0, 0)
+    }
+
     /// The bytes decoded, with the EXIF orientation applied, or nil when no loader reads them. An animated
     /// source gives its first frame, as on Apple platforms.
     static func decode(_ data: Data) -> DecodedImage? {
@@ -52,6 +63,13 @@ enum ImageProcessing {
         defer {
             g_object_unref(UnsafeMutableRawPointer(loader))
         }
+        let refused = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
+        refused.initialize(to: false)
+        defer {
+            refused.deallocate()
+        }
+        g_signal_connect_data(UnsafeMutableRawPointer(loader), "size-prepared", unsafeBitCast(sizePrepared, to: GCallback.self),
+                              refused, nil, G_CONNECT_DEFAULT)
         var writeError: UnsafeMutablePointer<GError>?
         let wrote = data.withUnsafeBytes { raw -> gboolean in
             gdk_pixbuf_loader_write(loader, raw.bindMemory(to: guchar.self).baseAddress, gsize(raw.count), &writeError)
@@ -65,7 +83,7 @@ enum ImageProcessing {
         if let closeError {
             g_error_free(closeError)
         }
-        guard wrote != 0, closed != 0, let frame = gdk_pixbuf_loader_get_pixbuf(loader) else {
+        guard wrote != 0, closed != 0, !refused.pointee, let frame = gdk_pixbuf_loader_get_pixbuf(loader) else {
             return nil
         }
         // The loader's pixbuf is borrowed; the oriented one is a new reference (the same pixbuf when upright).

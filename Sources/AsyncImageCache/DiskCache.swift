@@ -218,7 +218,8 @@ final class DiskCache: @unchecked Sendable {
     }
 
     private func writePixelSize(_ size: CGSize, at file: URL) {
-        guard size.width > 0, size.height > 0 else {
+        // The limit keeps both sides in an Int32: this can run on a size read from the header of a cached file.
+        guard size.width > 0, size.height > 0, ImageLimits.accepts(width: size.width, height: size.height) else {
             return
         }
         var record = PixelSizeAttr(width: Int32(size.width.rounded()), height: Int32(size.height.rounded()))

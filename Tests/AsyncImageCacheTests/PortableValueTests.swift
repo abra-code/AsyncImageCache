@@ -68,4 +68,17 @@ final class PortableValueTests: XCTestCase {
             XCTAssertTrue(Set([request]).contains(request))
         }
     }
+
+    func testImageSizeLimits() {
+        XCTAssertTrue(ImageLimits.accepts(width: 12000, height: 9000), "a large photo")
+        XCTAssertTrue(ImageLimits.accepts(width: 65536, height: 1), "the longest side")
+        XCTAssertTrue(ImageLimits.accepts(width: 16384, height: 16384), "the most pixels: about 1 GB decoded")
+        XCTAssertFalse(ImageLimits.accepts(width: 16385, height: 16384))
+        XCTAssertFalse(ImageLimits.accepts(width: 65537, height: 1))
+        XCTAssertFalse(ImageLimits.accepts(width: 1, height: 65537))
+        XCTAssertFalse(ImageLimits.accepts(width: 1e300, height: 1e300), "the product is an infinity")
+        XCTAssertFalse(ImageLimits.accepts(width: .infinity, height: 1))
+        XCTAssertFalse(ImageLimits.accepts(width: .nan, height: 1))
+        XCTAssertTrue(ImageLimits.accepts(width: 0, height: 0), "no size is for the decoder to judge, as before")
+    }
 }

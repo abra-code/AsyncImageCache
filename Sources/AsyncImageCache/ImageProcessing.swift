@@ -28,12 +28,18 @@ enum ImageProcessing {
         return CGImageSourceGetCount(source) > 1
     }
 
-    /// The backing CGImage, if the platform image has one.
+    /// The backing CGImage, if the platform image has one. A vector image (SVG, PDF) has no pixels of its own:
+    /// asked plainly, AppKit rasterizes it at the display's backing scale, four times the pixels ImageLimits
+    /// checked on a Retina screen and at 8 bytes each. The identity transform holds it to the size it declares.
     static func cgImage(from image: PlatformImage) -> CGImage? {
         #if canImport(UIKit)
         return image.cgImage
         #else
-        return image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        guard !image.representations.contains(where: { $0.pixelsWide > 0 && $0.pixelsHigh > 0 }) else {
+            return image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        }
+        var rect = CGRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: [.ctm: NSAffineTransform()])
         #endif
     }
 
@@ -134,6 +140,12 @@ enum ImageProcessing {
         }
         return (best.width > 0 && best.height > 0) ? best : image.size
         #endif
+    }
+
+    /// Whether the size the image declares is one this package decodes (ImageLimits), from its metadata alone.
+    static func isWithinLimits(_ image: PlatformImage) -> Bool {
+        let size = pixelSize(of: image)
+        return ImageLimits.accepts(width: size.width, height: size.height)
     }
 
     /// The resident RAM footprint of a decoded image in bytes - its DECODED bitmap, not its compressed

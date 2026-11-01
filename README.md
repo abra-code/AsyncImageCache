@@ -103,6 +103,10 @@ the bytes were cached by a build that predates the attribute - the size is recov
 `CGImageSource` (still no full decode), and the xattr is REPAIRED so the next read is back on the fast path. So
 a lost attribute costs one slightly-slower read, never a wrong box or a full decode.
 
+## Image size limit
+
+A file names its own size, and an image can come from anywhere, so an image declaring more than 65,536 pixels on a side, or more than 268 megapixels (16384 x 16384), is refused before anything is rasterized: it fails to load like a corrupt file, and nothing is cached. That is well past any photo or panorama. Vector images (SVG, PDF on macOS) count at the size they declare, and rasterize at that size. Such an image still costs 2 to 4 GB at the peak of loading it.
+
 ## Linux
 
 On Linux the same `AsyncImageCache` module builds over the platform's own libraries, found through pkg-config: GTK 4 (`gtk4`, which brings GLib and GdkPixbuf) and libsoup 3 (`libsoup-3.0`). It uses FoundationEssentials only, so a program that links it carries no ICU data. The oldest versions supported are GNOME 48's: GTK 4.18, GLib 2.84 and libsoup 3.6. https needs the GIO TLS backend, glib-networking, which GNOME desktops install.

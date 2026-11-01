@@ -146,6 +146,32 @@ final class LinuxImageProcessingTests: XCTestCase {
 
     // MARK: - Decode and headers
 
+    // Whole PNGs, gray, one row, compressed to next to nothing: their size is what they declare.
+    private let widestPNG = "iVBORw0KGgoAAAANSUhEUgABAAAAAAABCAAAAABOGbwEAAAAVUlEQVR42u3BAQEAAACCIP+vriFAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwA0AEAAB0iWUEQAAAABJRU5ErkJggg=="
+    private let tooWidePNG = "iVBORw0KGgoAAAANSUhEUgABAAEAAAABCAAAAACh29c6AAAAVklEQVR42u3BAQ0AAADCoPdP7ewBFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANwAABEAAVjrzqEAAAAASUVORK5CYII="
+
+    func testDecodeRefusesAnImageLargerThanTheLimit() throws {
+        let accepted = try XCTUnwrap(Data(base64Encoded: widestPNG))
+        XCTAssertEqual(ImageProcessing.decode(accepted)?.width, 65536, "at the limit it decodes")
+        let refused = try XCTUnwrap(Data(base64Encoded: tooWidePNG))
+        XCTAssertNil(ImageProcessing.decode(refused), "past it, before any pixels are allocated")
+    }
+
+    // gdk-pixbuf's ICNS loader decodes all of its PNG before it reports the size, and a loader told to give up then
+    // still finishes with a pixbuf. What refuses this one is decode's own flag, which a PNG on its own never tests.
+    func testDecodeRefusesAnImageItsLoaderHasAlreadyDecoded() throws {
+        func icns(_ png: Data) -> Data {
+            func length(_ count: Int) -> Data {
+                Data([UInt8(count >> 24 & 0xFF), UInt8(count >> 16 & 0xFF), UInt8(count >> 8 & 0xFF), UInt8(count & 0xFF)])
+            }
+            return Data("icns".utf8) + length(16 + png.count) + Data("ic08".utf8) + length(8 + png.count) + png
+        }
+        let accepted = try XCTUnwrap(Data(base64Encoded: widestPNG))
+        try XCTSkipIf(ImageProcessing.decode(icns(accepted)) == nil, "this system has no ICNS loader")
+        let refused = try XCTUnwrap(Data(base64Encoded: tooWidePNG))
+        XCTAssertNil(ImageProcessing.decode(icns(refused)))
+    }
+
     func testDecodeRejectsBytesNoLoaderReads() {
         XCTAssertNil(ImageProcessing.decode(Data()))
         XCTAssertNil(ImageProcessing.decode(Data("not an image".utf8)))
