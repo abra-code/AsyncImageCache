@@ -69,7 +69,7 @@ enum ImageProcessing {
             refused.deallocate()
         }
         g_signal_connect_data(UnsafeMutableRawPointer(loader), "size-prepared", unsafeBitCast(sizePrepared, to: GCallback.self),
-                              refused, nil, G_CONNECT_DEFAULT)
+                              refused, nil, GConnectFlags(rawValue: 0))
         var writeError: UnsafeMutablePointer<GError>?
         let wrote = data.withUnsafeBytes { raw -> gboolean in
             gdk_pixbuf_loader_write(loader, raw.bindMemory(to: guchar.self).baseAddress, gsize(raw.count), &writeError)

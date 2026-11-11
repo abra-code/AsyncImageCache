@@ -12,4 +12,8 @@
 
 #include <gtk/gtk.h>
 
+// GLib 2.88 declares its flags types with G_GNUC_FLAG_ENUM, and Swift then imports them as option sets whose
+// members lose their C names (G_CONNECT_DEFAULT is not found). Swift code writes no flags as init(rawValue: 0),
+// never Type(0) or a C name, so it builds under every GLib version.
+
 #endif
