@@ -793,4 +793,42 @@ final class AsyncImageCacheTests: XCTestCase {
         XCTAssertNotNil(result, "a vector image of a normal size is not refused")
         #endif
     }
+
+    // MARK: - The download session
+
+    // An image address can come from anywhere: its fetch carries none of the app's cookies or stored
+    // credentials, and refuses sign-in challenges but the server certificate check.
+    func testDownloadsCarryNoCookiesOrCredentials() {
+        let session = ImageStore.urlSession
+        let configuration = session.configuration
+        XCTAssertNil(configuration.httpCookieStorage)
+        XCTAssertFalse(configuration.httpShouldSetCookies)
+        XCTAssertNil(configuration.urlCredentialStorage)
+        XCTAssertNil(configuration.urlCache)
+        XCTAssertTrue(session.delegate is ImageStore.NoSignIn, "the session answers its challenges")
+        // Both Objective-C entry points are there, so URLSession calls the delegate at both levels.
+        for selector in ["URLSession:didReceiveChallenge:completionHandler:", "URLSession:task:didReceiveChallenge:completionHandler:"] {
+            XCTAssertTrue(session.delegate?.responds(to: NSSelectorFromString(selector)) == true, selector)
+        }
+        func challenge(_ method: String, proxy: Bool = false) -> URLAuthenticationChallenge {
+            let space = proxy
+                ? URLProtectionSpace(proxyHost: "proxy.example.com", port: 8080, type: NSURLProtectionSpaceHTTPProxy, realm: nil, authenticationMethod: method)
+                : URLProtectionSpace(host: "example.com", port: 443, protocol: "https", realm: nil, authenticationMethod: method)
+            return URLAuthenticationChallenge(protectionSpace: space, proposedCredential: nil, previousFailureCount: 0,
+                                              failureResponse: nil, error: nil, sender: NoSender())
+        }
+        for method in [NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodNegotiate, NSURLAuthenticationMethodClientCertificate] {
+            XCTAssertEqual(ImageStore.answer(to: challenge(method)), .rejectProtectionSpace, method)
+        }
+        XCTAssertEqual(ImageStore.answer(to: challenge(NSURLAuthenticationMethodHTTPBasic, proxy: true)), .performDefaultHandling,
+                       "a proxy's sign-in is the network's")
+        XCTAssertEqual(ImageStore.answer(to: challenge(NSURLAuthenticationMethodServerTrust)), .performDefaultHandling,
+                       "the server certificate is checked by the system")
+    }
+}
+
+private final class NoSender: NSObject, URLAuthenticationChallengeSender {
+    func use(_ credential: URLCredential, for challenge: URLAuthenticationChallenge) {}
+    func continueWithoutCredential(for challenge: URLAuthenticationChallenge) {}
+    func cancel(_ challenge: URLAuthenticationChallenge) {}
 }

@@ -364,12 +364,43 @@ public final class ImageStore: @unchecked Sendable {
     }
 
     // Downloads bypass the shared URLCache: DiskCache already persists the fetched bytes, and the default
-    // shared cache would store a second copy of every image on disk.
-    private static let urlSession: URLSession = {
+    // shared cache would store a second copy of every image on disk. They carry none of the app's cookies
+    // or stored credentials, and answer no sign-in challenge of the image host (the system's single
+    // sign-on included): an image address can come from anywhere, and fetching it must not act as the
+    // app's signed-in user. The Linux session has no cookie jar either.
+    static let urlSession: URLSession = {
         let configuration = URLSessionConfiguration.default
         configuration.urlCache = nil
-        return URLSession(configuration: configuration)
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        return URLSession(configuration: configuration, delegate: NoSignIn(), delegateQueue: nil)
     }()
+
+    // The answer to an authentication challenge. The check of the server's own certificate and a proxy's
+    // sign-in (the network's, not the image host's) are left to the system; any other is declined, so the
+    // fetch goes on without credentials: a server that only asks for a client certificate still answers,
+    // and one that needs a sign-in answers 401, which acceptableBody refuses.
+    static func answer(to challenge: URLAuthenticationChallenge) -> URLSession.AuthChallengeDisposition {
+        let space = challenge.protectionSpace
+        if space.authenticationMethod == NSURLAuthenticationMethodServerTrust || space.isProxy() {
+            return .performDefaultHandling
+        }
+        return .rejectProtectionSpace
+    }
+
+    // The download session's delegate: it answers authentication challenges only.
+    final class NoSignIn: NSObject, URLSessionTaskDelegate, Sendable {
+        func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge)
+            async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+            (ImageStore.answer(to: challenge), nil)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge)
+            async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+            (ImageStore.answer(to: challenge), nil)
+        }
+    }
 
     // The ONLY main-thread work: fire the pending completions. The image + completions are non-Sendable
     // (NSImage, caller closures), so they cross the hop inside an UncheckedSendableBox.

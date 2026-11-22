@@ -78,7 +78,8 @@ ImageStore.shared.load(ImageRequest(url: url, targetWidth: 840, cornerRadius: 10
     after the file is edited. In memory, a local file's entries are keyed on its modification time and size
     too, so the next load after an edit reads the new picture (the store does not watch files).
 - Byte resolution order (off-main): in-memory originals -> disk -> source (`data:`/`file:` decode locally,
-  `http(s)` via `URLSession`).
+  `http(s)` via `URLSession`, with none of the app's cookies or stored credentials, and no answer to a
+  sign-in challenge: an image address can come from anywhere).
 - Variant key quantization: `targetWidth` / `cornerRadius` are `CGFloat` in the API (caller convenience) but
   QUANTIZED to whole pixels in the cache key, so sub-pixel layout jitter does not mint a distinct variant per
   fractional value; the store scales to the same quantized values.
@@ -118,7 +119,7 @@ The API is the one above, with these differences:
 - Completions run on the thread of GLib's default main context, the GTK main loop, so any GTK program receives them however it drives libdispatch's main queue. Tests that wait for one iterate the context (`g_main_context_iteration`).
 - Decoding goes through GdkPixbuf's loaders (PNG, JPEG, GIF, TIFF, and others the system installs, such as WebP), with the EXIF orientation applied. A truncated image does not decode.
 - The disk cache lives in `$XDG_CACHE_HOME/AsyncImageCache/<name>/` (`~/.cache` by default), with the same file names as on Apple platforms. The size, animated flag and placeholder are kept in a `<file>.meta` file beside each image rather than in extended attributes, which Linux cache folders cannot be relied on to keep. The format is the Android port's.
-- http and https go through one libsoup session, which sends a User-Agent and allows six connections per host, as URLSession does.
+- http and https go through one libsoup session, which sends a User-Agent and allows six connections per host, as URLSession does, and has no cookie jar, as the Apple session keeps none.
 - Linux has no memory-pressure signal for a process, so the memory limits are the whole bound. `recommendedMemoryByteLimit()` uses the desktop range: 1/16 of RAM, between 256 MB and 1 GB.
 - `CachedImage` (the SwiftUI view) is Apple-only.
 
