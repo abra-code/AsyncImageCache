@@ -1,7 +1,7 @@
 // Tests/AsyncImageCacheTests/AsyncImageCacheTests.swift
 //
-// Exercises the async loader + two-tier cache end to end, using ONLY data: and file: URLs (no network is
-// assumed available). Covers: data: load + sync cache hit + main-thread completion; downscale to a target
+// Exercises the async loader + two-tier cache end to end, using data: and file: URLs, and a loopback HTTP server
+// for the download size limit (no outside network is assumed available). Covers: data: load + sync cache hit + main-thread completion; downscale to a target
 // width; disk persistence across a fresh ImageStore(name:); file: images kept out of the disk tier; the
 // transcode/format decisions; and removeAll.
 
@@ -9,6 +9,7 @@ import XCTest
 import CoreGraphics
 import ImageIO
 import CryptoKit
+import Network
 @testable import AsyncImageCache
 
 #if canImport(UIKit)
@@ -595,6 +596,76 @@ final class AsyncImageCacheTests: XCTestCase {
         XCTAssertEqual(ImageStore.acceptableBody(body, nil), body, "a non-HTTP response is accepted as-is")
     }
 
+    // MARK: - Download size limit
+
+    func testDownloadByteLimitDefaultsSetsAndClamps() {
+        let store = ImageStore(name: uniqueName())
+        XCTAssertEqual(store.downloadByteLimit, 32 * 1024 * 1024)
+        XCTAssertEqual(ImageStore.defaultDownloadByteLimit, 32 * 1024 * 1024)
+        store.downloadByteLimit = 500 * 1024 * 1024
+        XCTAssertEqual(store.downloadByteLimit, 500 * 1024 * 1024)
+        store.downloadByteLimit = -5
+        XCTAssertEqual(store.downloadByteLimit, 0, "a negative limit counts as 0")
+        XCTAssertEqual(ImageStore(name: uniqueName(), downloadByteLimit: 1000).downloadByteLimit, 1000)
+        XCTAssertEqual(ImageStore(name: uniqueName(), downloadByteLimit: -1).downloadByteLimit, 0)
+    }
+
+    // A body one byte past the limit is refused, whether it declares its length or not, and nothing is cached;
+    // with the limit raised to the body's size the same address loads.
+    func testADownloadPastItsLimitIsRefusedUntilTheLimitIsRaised() throws {
+        let png = pngData(width: 40, height: 20)
+        let server = try LocalHTTPServer(png: png)
+        defer { server.stop() }
+        for path in ["/sized.png", "/unsized.png"] {
+            let store = ImageStore(name: uniqueName(), downloadByteLimit: png.count - 1)
+            defer { store.removeAll() }
+            let url = server.url(path)
+            XCTAssertNil(load(store, url), path)
+            XCTAssertFalse(store.diskFileExists(for: url), path)
+            XCTAssertNil(store.cachedPixelSize(for: url), path)
+            store.downloadByteLimit = png.count
+            let image = load(store, url)
+            XCTAssertNotNil(image, path)
+            XCTAssertEqual(store.cachedPixelSize(for: url), CGSize(width: 40, height: 20), path)
+            XCTAssertTrue(store.diskFileExists(for: url), path)
+        }
+    }
+
+    // A declared length past the limit ends the download before its body is read. The server declares a
+    // gigabyte but sends only a few kilobytes, so a download that waited for the body would wait until the time out.
+    func testADeclaredLengthPastTheLimitIsRefusedAtOnce() throws {
+        let server = try LocalHTTPServer(png: pngData(width: 4, height: 4))
+        defer { server.stop() }
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let start = Date()
+        XCTAssertNil(load(store, server.url("/huge.png")))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5)
+    }
+
+    // An error status is refused before its body is read, so an error page is never cached.
+    func testAnErrorStatusDeliversNil() throws {
+        let server = try LocalHTTPServer(png: pngData(width: 4, height: 4))
+        defer { server.stop() }
+        let store = ImageStore(name: uniqueName())
+        defer { store.removeAll() }
+        let url = server.url("/missing.png")
+        XCTAssertNil(load(store, url))
+        XCTAssertFalse(store.diskFileExists(for: url))
+    }
+
+    // Loads `url` and waits for the completion on the main thread.
+    private func load(_ store: ImageStore, _ url: URL) -> PlatformImage? {
+        let done = expectation(description: "completion")
+        var result: PlatformImage?
+        store.load(ImageRequest(url: url)) { image in
+            result = image
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 10)
+        return result
+    }
+
     // MARK: - Memory cost limit
 
     func testMemoryCostReflectsDecodedBitmapSize() throws {
@@ -810,6 +881,9 @@ final class AsyncImageCacheTests: XCTestCase {
         for selector in ["URLSession:didReceiveChallenge:completionHandler:", "URLSession:task:didReceiveChallenge:completionHandler:"] {
             XCTAssertTrue(session.delegate?.responds(to: NSSelectorFromString(selector)) == true, selector)
         }
+        // A download's own delegate answers the task-level challenge, which reaches it first, the same way.
+        let download = ImageStore.CappedDownload(limit: 1) { _ in }
+        XCTAssertTrue(download.responds(to: NSSelectorFromString("URLSession:task:didReceiveChallenge:completionHandler:")))
         func challenge(_ method: String, proxy: Bool = false) -> URLAuthenticationChallenge {
             let space = proxy
                 ? URLProtectionSpace(proxyHost: "proxy.example.com", port: 8080, type: NSURLProtectionSpaceHTTPProxy, realm: nil, authenticationMethod: method)
@@ -831,4 +905,96 @@ private final class NoSender: NSObject, URLAuthenticationChallengeSender {
     func use(_ credential: URLCredential, for challenge: URLAuthenticationChallenge) {}
     func continueWithoutCredential(for challenge: URLAuthenticationChallenge) {}
     func cancel(_ challenge: URLAuthenticationChallenge) {}
+}
+
+// A loopback HTTP/1.1 server for the download tests: /sized.png sends `png` with its Content-Length, /unsized.png
+// sends it with none (the body ends when the connection closes), /huge.png declares a gigabyte, sends `png` and 4 KB
+// more and keeps the connection open, and any other path answers 404 with `png` as its body.
+private final class LocalHTTPServer: @unchecked Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "AsyncImageCacheTests.LocalHTTPServer")
+    private let png: Data
+    private var connections: [NWConnection] = []   // touched on `queue`
+
+    init(png: Data) throws {
+        self.png = png
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+        listener = try NWListener(using: parameters)
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready, .failed, .cancelled:
+                ready.signal()
+            default:
+                break
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            connections.append(connection)
+            connection.start(queue: queue)
+            receiveRequest(on: connection, Data())
+        }
+        listener.start(queue: queue)
+        _ = ready.wait(timeout: .now() + 5)
+        guard listener.port != nil else {
+            listener.cancel()
+            throw XCTSkip("no local server")
+        }
+    }
+
+    func url(_ path: String) -> URL {
+        URL(string: "http://127.0.0.1:\(listener.port!.rawValue)\(path)")!
+    }
+
+    func stop() {
+        queue.sync {
+            connections.forEach { $0.cancel() }
+            connections = []
+        }
+        listener.cancel()
+    }
+
+    private func receiveRequest(on connection: NWConnection, _ received: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [self] data, _, isComplete, error in
+            var request = received
+            if let data {
+                request.append(data)
+            }
+            guard let end = request.range(of: Data("\r\n\r\n".utf8)) else {
+                if error == nil, !isComplete {
+                    receiveRequest(on: connection, request)
+                } else {
+                    connection.cancel()
+                }
+                return
+            }
+            let words = String(decoding: request[..<end.lowerBound], as: UTF8.self).split(separator: " ")
+            respond(to: words.count > 1 ? String(words[1]) : "", on: connection)
+        }
+    }
+
+    private func respond(to path: String, on connection: NWConnection) {
+        let head: String
+        switch path {
+        case "/sized.png":
+            head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: \(png.count)\r\nConnection: close\r\n\r\n"
+        case "/unsized.png":
+            head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nConnection: close\r\n\r\n"
+        case "/huge.png":
+            head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 1073741824\r\n\r\n"
+            // URLSession holds the response back until it has about 512 bytes of body to sniff the type from.
+            connection.send(content: Data(head.utf8) + png + Data(count: 4096), completion: .contentProcessed { _ in })
+            return
+        default:
+            head = "HTTP/1.1 404 Not Found\r\nContent-Type: image/png\r\nContent-Length: \(png.count)\r\nConnection: close\r\n\r\n"
+        }
+        // The final message: the connection closes once it is sent.
+        connection.send(content: Data(head.utf8) + png, contentContext: .finalMessage, isComplete: true,
+                        completion: .contentProcessed { _ in })
+    }
 }

@@ -75,6 +75,33 @@ public final class ImageStore: @unchecked Sendable {
     // completion, and all fire together when the single fetch finishes. Guarded by `lock`.
     private let lock = NSLock()
     private var inFlight: [ImageRequest: [(PlatformImage?) -> Void]] = [:]
+    private var currentDownloadByteLimit: Int   // guarded by `lock`
+
+    /// The default `downloadByteLimit`: 32 MB, past any photo a web page shows. A raw camera file or a photo
+    /// saved with little compression can be larger; a host that shows those raises the limit.
+    public static let defaultDownloadByteLimit = 32 * 1024 * 1024
+
+    /// The most bytes one http or https download may bring, so a server cannot fill memory with an endless or
+    /// huge body. A response that declares a larger size is refused at once, and one that sends more is cut off
+    /// when it passes the limit; the load then delivers nil, as for a failed download, and nothing is cached.
+    /// Images read from a file or a data: URL, and bytes already in the cache, are not limited. Thread-safe; a
+    /// new value applies to downloads that start after it is set, so a host sets it at launch, for example
+    /// `ImageStore.shared.downloadByteLimit = 200 * 1024 * 1024` for raw camera files. A negative value counts
+    /// as 0; `Int.max` removes the limit.
+    public var downloadByteLimit: Int {
+        get {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            return currentDownloadByteLimit
+        }
+        set {
+            lock.lock()
+            currentDownloadByteLimit = max(0, newValue)
+            lock.unlock()
+        }
+    }
 
     /// - Parameters:
     ///   - name: names the on-disk subdirectory and work queue; distinct names are fully independent caches.
@@ -87,10 +114,13 @@ public final class ImageStore: @unchecked Sendable {
     ///     not a reservation. Defaults to `recommendedMemoryByteLimit()`, which scales with device RAM. Set it
     ///     comfortably above the largest single decoded image you expect, or that image cannot stay resident.
     ///   - diskByteLimit: soft byte budget for the on-disk original bytes.
+    ///   - downloadByteLimit: the most bytes one http or https download may bring (see `downloadByteLimit`).
     public init(name: String = "default",
                 memoryCountLimit: Int = 150,
                 memoryByteLimit: Int = ImageStore.recommendedMemoryByteLimit(),
-                diskByteLimit: Int = 200 * 1024 * 1024) {
+                diskByteLimit: Int = 200 * 1024 * 1024,
+                downloadByteLimit: Int = ImageStore.defaultDownloadByteLimit) {
+        currentDownloadByteLimit = max(0, downloadByteLimit)
         variantCache.countLimit = memoryCountLimit
         originalCache.countLimit = memoryCountLimit
         variantCache.totalCostLimit = max(0, memoryByteLimit)
@@ -276,8 +306,8 @@ public final class ImageStore: @unchecked Sendable {
         } else if let scheme = url.scheme?.lowercased(), scheme == "data" || scheme == "file" {
             finishProduction(request, bytes: try? Data(contentsOf: url), writeDisk: true, version: version)
         } else {
-            let task = Self.urlSession.dataTask(with: url) { [self] data, response, _ in
-                let bytes = Self.acceptableBody(data, response)
+            let task = Self.urlSession.dataTask(with: url)
+            task.delegate = CappedDownload(limit: downloadByteLimit) { [self] bytes in
                 workQueue.async { [self] in
                     finishProduction(request, bytes: bytes, writeDisk: true, version: version)
                 }
@@ -357,10 +387,21 @@ public final class ImageStore: @unchecked Sendable {
     // "successful" variant or persisted to disk (which would then be served forever). A non-HTTP response
     // (uncommon on this branch, which only handles remote schemes) is accepted as-is.
     static func acceptableBody(_ data: Data?, _ response: URLResponse?) -> Data? {
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            return nil
+        isAcceptable(response) ? data : nil
+    }
+
+    static func isAcceptable(_ response: URLResponse?) -> Bool {
+        guard let http = response as? HTTPURLResponse else {
+            return true
         }
-        return data
+        return (200...299).contains(http.statusCode)
+    }
+
+    // Whether a response declaring `expectedLength` bytes (-1 when it declares none) is past `limit`. With gzip
+    // or another content encoding the declared length is the encoded one; the bytes counted as they arrive are
+    // the decoded ones, so a small body that decodes to a huge one is still cut off.
+    static func declaresMore(_ expectedLength: Int64, than limit: Int) -> Bool {
+        expectedLength > Int64(limit)
     }
 
     // Downloads bypass the shared URLCache: DiskCache already persists the fetched bytes, and the default
@@ -399,6 +440,56 @@ public final class ImageStore: @unchecked Sendable {
         func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge)
             async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
             (ImageStore.answer(to: challenge), nil)
+        }
+    }
+
+    // One download's own delegate: it keeps the body up to `limit` bytes and passes it, or nil, to `done` once
+    // the task ends. The session's delegate still answers the session-level challenges; the task-level one is
+    // answered here the same way. URLSession calls a task's delegate on the session's delegate queue, which is
+    // serial (the session was made with none of its own), so the mutable state is never touched by two threads.
+    final class CappedDownload: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        private let limit: Int
+        private let done: @Sendable (Data?) -> Void
+        private var body = Data()
+        private var refused = false
+
+        init(limit: Int, done: @escaping @Sendable (Data?) -> Void) {
+            self.limit = limit
+            self.done = done
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+            // An error status or a declared size past the limit ends the task before its body is read.
+            guard ImageStore.isAcceptable(response),
+                  !ImageStore.declaresMore(response.expectedContentLength, than: limit) else {
+                refused = true
+                completionHandler(.cancel)
+                return
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            guard !refused else {
+                return
+            }
+            guard data.count <= limit - body.count else {
+                refused = true
+                body = Data()
+                dataTask.cancel()
+                return
+            }
+            body.append(data)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge)
+            async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+            (ImageStore.answer(to: challenge), nil)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            done(error == nil && !refused ? ImageStore.acceptableBody(body, task.response) : nil)
         }
     }
 

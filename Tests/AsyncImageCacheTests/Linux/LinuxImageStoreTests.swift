@@ -153,6 +153,87 @@ final class LinuxImageStoreTests: XCTestCase {
         XCTAssertFalse(store.diskFileExists(for: missing), "an error page is never persisted")
     }
 
+    // A body one byte past the limit is refused, whether it declares its length or comes in chunks, and nothing is
+    // cached; with the limit raised to the body's size the same address loads.
+    func testHTTPRefusesABodyPastTheLimitUntilTheLimitIsRaised() throws {
+        let png = try pngData(width: 12, height: 6)
+        let server = try LocalServer(png: png)
+        defer {
+            server.stop()
+        }
+        for path in ["/ok.png", "/chunked.png"] {
+            let store = makeStore(downloadByteLimit: png.count - 1)
+            let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)\(path)"))
+            XCTAssertNil(load(store, ImageRequest(url: url)), path)
+            XCTAssertFalse(store.diskFileExists(for: url), path)
+            store.downloadByteLimit = png.count
+            XCTAssertNotNil(load(store, ImageRequest(url: url)), path)
+            XCTAssertTrue(store.diskFileExists(for: url), path)
+        }
+    }
+
+    // A body that never ends is cut off at the limit, and the main loop is not held reading the rest.
+    func testHTTPCutsOffAnEndlessBody() throws {
+        let server = try LocalServer(png: try pngData(width: 12, height: 6))
+        defer {
+            server.stop()
+        }
+        let store = makeStore(downloadByteLimit: 1 << 20)
+        let start = Date()
+        XCTAssertNil(load(store, ImageRequest(url: try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)/endless.png")))))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5)
+    }
+
+    // A declared length past the limit ends the download before its body is read. The server declares a gigabyte and
+    // sends only the picture, so a download that waited for the body would wait until the time out.
+    func testHTTPRefusesADeclaredLengthPastTheLimitAtOnce() throws {
+        let server = try LocalServer(png: try pngData(width: 12, height: 6))
+        defer {
+            server.stop()
+        }
+        let store = makeStore()
+        let start = Date()
+        XCTAssertNil(load(store, ImageRequest(url: try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)/huge.png")))))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5)
+    }
+
+    func testHTTPFollowsRedirectsUpToItsLimit() throws {
+        let server = try LocalServer(png: try pngData(width: 12, height: 6))
+        defer {
+            server.stop()
+        }
+        let store = makeStore()
+        let redirected = try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)/redirect.png"))
+        let image = try XCTUnwrap(load(store, ImageRequest(url: redirected)), "a redirect is followed")
+        XCTAssertEqual([image.pixelWidth, image.pixelHeight], [12, 6])
+        XCTAssertTrue(store.diskFileExists(for: redirected), "kept under the address asked for")
+        XCTAssertNil(load(store, ImageRequest(url: try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)/loop.png")))),
+                     "a redirect loop ends")
+    }
+
+    // A redirect's own body is not read: libsoup's own following reads it into memory, and an endless one never ends.
+    func testHTTPDropsARedirectsBodyUnread() throws {
+        let server = try LocalServer(png: try pngData(width: 12, height: 6))
+        defer {
+            server.stop()
+        }
+        let store = makeStore()
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)/redirect-endless.png"))
+        let image = try XCTUnwrap(load(store, ImageRequest(url: url)), "the redirect is followed")
+        XCTAssertEqual([image.pixelWidth, image.pixelHeight], [12, 6])
+    }
+
+    func testDownloadByteLimitDefaultsSetsAndClamps() {
+        let store = makeStore()
+        XCTAssertEqual(store.downloadByteLimit, 32 * 1024 * 1024)
+        XCTAssertEqual(ImageStore.defaultDownloadByteLimit, 32 * 1024 * 1024)
+        store.downloadByteLimit = 500 * 1024 * 1024
+        XCTAssertEqual(store.downloadByteLimit, 500 * 1024 * 1024)
+        store.downloadByteLimit = -5
+        XCTAssertEqual(store.downloadByteLimit, 0, "a negative limit counts as 0")
+        XCTAssertEqual(makeStore(downloadByteLimit: -1).downloadByteLimit, 0)
+    }
+
     // MARK: - Disk cache
 
     // The same file names as the Apple cache (CryptoKit's SHA-256 there, GChecksum here).
@@ -283,8 +364,8 @@ final class LinuxImageStoreTests: XCTestCase {
         "test-\(UUID().uuidString)"
     }
 
-    private func makeStore(name: String? = nil) -> ImageStore {
-        let store = ImageStore(name: name ?? uniqueName())
+    private func makeStore(name: String? = nil, downloadByteLimit: Int = ImageStore.defaultDownloadByteLimit) -> ImageStore {
+        let store = ImageStore(name: name ?? uniqueName(), downloadByteLimit: downloadByteLimit)
         stores.append(store)
         return store
     }
@@ -339,7 +420,9 @@ final class LinuxImageStoreTests: XCTestCase {
     }
 }
 
-// A libsoup server on 127.0.0.1 serving `png` at /ok.png with status 200 and at /missing.png with 404.
+// A libsoup server on 127.0.0.1. /ok.png serves `png` with status 200 and its Content-Length, /chunked.png the same in
+// chunks with no length, /endless.png chunks that never end, and /huge.png declares a gigabyte and sends only `png`.
+// /redirect.png redirects to /ok.png, /redirect-endless.png too with chunks that never end, /loop.png to itself, and any other path answers 404 with `png` as its body.
 private final class LocalServer {
     private final class Body {
         let png: Data
@@ -353,6 +436,14 @@ private final class LocalServer {
     private let body: Unmanaged<Body>
     let port: Int
 
+    // Appends `png` to a message's response body.
+    private static func append(_ png: Data, to message: OpaquePointer) {
+        png.withUnsafeBytes { raw in
+            soup_message_body_append(soup_server_message_get_response_body(message), SOUP_MEMORY_COPY,
+                                     raw.baseAddress, gsize(raw.count))
+        }
+    }
+
     init(png: Data) throws {
         let made = try XCTUnwrap(g_object_new_with_properties(soup_server_get_type(), 0, nil, nil))
         server = UnsafeMutableRawPointer(made).assumingMemoryBound(to: SoupServer.self)
@@ -363,11 +454,53 @@ private final class LocalServer {
             }
             let body = Unmanaged<Body>.fromOpaque(data).takeUnretainedValue()
             let png = body.png
+            let headers = soup_server_message_get_response_headers(message)
             if let agent = soup_message_headers_get_one(soup_server_message_get_request_headers(message), "User-Agent") {
                 body.userAgent = String(cString: agent)
             }
-            let status: guint = String(cString: path) == "/ok.png" ? 200 : 404
-            soup_server_message_set_status(message, status, nil)
+            switch String(cString: path) {
+            case "/ok.png":
+                soup_server_message_set_status(message, 200, nil)
+            case "/chunked.png":
+                soup_server_message_set_status(message, 200, nil)
+                soup_message_headers_set_encoding(headers, SOUP_ENCODING_CHUNKED)
+                LocalServer.append(png, to: message)
+                soup_message_body_complete(soup_server_message_get_response_body(message))
+                return
+            case "/endless.png", "/redirect-endless.png":
+                if String(cString: path) == "/endless.png" {
+                    soup_server_message_set_status(message, 200, nil)
+                } else {
+                    soup_server_message_set_status(message, 302, nil)
+                    soup_message_headers_replace(headers, "Location", "/ok.png")
+                }
+                soup_message_headers_set_encoding(headers, SOUP_ENCODING_CHUNKED)
+                LocalServer.append(Data(count: 64 * 1024), to: message)
+                // Each chunk written queues the next.
+                let next: @convention(c) (OpaquePointer?, gpointer?) -> Void = { message, _ in
+                    guard let message else {
+                        return
+                    }
+                    LocalServer.append(Data(count: 64 * 1024), to: message)
+                    soup_server_message_unpause(message)
+                }
+                g_signal_connect_data(UnsafeMutableRawPointer(message), "wrote-chunk", unsafeBitCast(next, to: GCallback.self),
+                                      nil, nil, GConnectFlags(rawValue: 0))
+                return
+            case "/huge.png":
+                soup_server_message_set_status(message, 200, nil)
+                soup_message_headers_set_content_length(headers, 1 << 30)
+                LocalServer.append(png, to: message)
+                return
+            case "/redirect.png":
+                soup_server_message_set_redirect(message, 302, "/ok.png")
+                return
+            case "/loop.png":
+                soup_server_message_set_redirect(message, 302, "/loop.png")
+                return
+            default:
+                soup_server_message_set_status(message, 404, nil)
+            }
             png.withUnsafeBytes { raw in
                 soup_server_message_set_response(message, "image/png", SOUP_MEMORY_COPY,
                                                  raw.baseAddress?.assumingMemoryBound(to: CChar.self), gsize(raw.count))

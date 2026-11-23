@@ -25,7 +25,12 @@ public final class ImageStore: @unchecked Sendable {
     public static let shared: ImageStore
     public init(name: String = "default", memoryCountLimit: Int = 150,
                 memoryByteLimit: Int = ImageStore.recommendedMemoryByteLimit(),  // scales with device RAM
-                diskByteLimit: Int = 200 * 1024 * 1024)
+                diskByteLimit: Int = 200 * 1024 * 1024,
+                downloadByteLimit: Int = ImageStore.defaultDownloadByteLimit)
+
+    // The most bytes one http or https download may bring (see "Download size limit"). Settable at any time.
+    public static let defaultDownloadByteLimit: Int   // 32 MB
+    public var downloadByteLimit: Int
 
     // A per-tier memory budget scaled to physical RAM (a fraction, clamped per platform). macOS gets a higher
     // ceiling than iOS, where NSCache's automatic memory-pressure purge is the real safety net.
@@ -108,6 +113,16 @@ a lost attribute costs one slightly-slower read, never a wrong box or a full dec
 
 A file names its own size, and an image can come from anywhere, so an image declaring more than 65,536 pixels on a side, or more than 268 megapixels (16384 x 16384), or 64 megapixels (8192 x 8192) on iOS, where the system ends an app that takes too much memory, is refused before anything is rasterized: it fails to load like a corrupt file, and nothing is cached. That is well past any photo or panorama. Vector images (SVG, PDF on macOS) count at the size they declare, and rasterize at that size. An image at the limit costs two to four times its decoded size at the peak of loading it: 2 to 4 GB, or up to about 1 GB on iOS.
 
+## Download size limit
+
+A server can send a huge body, or one that never ends, so one http or https download may bring at most `downloadByteLimit` bytes, 32 MB by default. A response that declares a larger size is refused before its body is read, and one that sends more is cut off when it passes the limit; the load then delivers nil, as for a failed download, and nothing is cached. Images read from a file or a data: URL, and bytes already in the cache, are not limited.
+
+32 MB is past any photo a web page shows. A host that shows raw camera files or photos saved with little compression raises the limit, on the shared store or its own, once at launch; a new value applies to downloads that start after it is set:
+
+```swift
+ImageStore.shared.downloadByteLimit = 200 * 1024 * 1024
+```
+
 ## Linux
 
 On Linux the same `AsyncImageCache` module builds over the platform's own libraries, found through pkg-config: GTK 4 (`gtk4`, which brings GLib and GdkPixbuf) and libsoup 3 (`libsoup-3.0`). It uses FoundationEssentials only, so a program that links it carries no ICU data. The oldest versions supported are GNOME 48's: GTK 4.18, GLib 2.84 and libsoup 3.6. https needs the GIO TLS backend, glib-networking, which GNOME desktops install.
@@ -119,7 +134,7 @@ The API is the one above, with these differences:
 - Completions run on the thread of GLib's default main context, the GTK main loop, so any GTK program receives them however it drives libdispatch's main queue. Tests that wait for one iterate the context (`g_main_context_iteration`).
 - Decoding goes through GdkPixbuf's loaders (PNG, JPEG, GIF, TIFF, and others the system installs, such as WebP), with the EXIF orientation applied. A truncated image does not decode.
 - The disk cache lives in `$XDG_CACHE_HOME/AsyncImageCache/<name>/` (`~/.cache` by default), with the same file names as on Apple platforms. The size, animated flag and placeholder are kept in a `<file>.meta` file beside each image rather than in extended attributes, which Linux cache folders cannot be relied on to keep. The format is the Android port's.
-- http and https go through one libsoup session, which sends a User-Agent and allows six connections per host, as URLSession does, and has no cookie jar, as the Apple session keeps none.
+- http and https go through one libsoup session, which sends a User-Agent and allows six connections per host, as URLSession does, and has no cookie jar, as the Apple session keeps none. The store reads each body in pieces to hold it to the download limit, and follows redirects itself (up to 20), since libsoup's own following reads a redirect's body outside any limit.
 - Linux has no memory-pressure signal for a process, so the memory limits are the whole bound. `recommendedMemoryByteLimit()` uses the desktop range: 1/16 of RAM, between 256 MB and 1 GB.
 - `CachedImage` (the SwiftUI view) is Apple-only.
 

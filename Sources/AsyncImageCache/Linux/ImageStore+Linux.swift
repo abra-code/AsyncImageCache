@@ -59,6 +59,27 @@ public final class ImageStore: @unchecked Sendable {
     // De-duplicate concurrent identical requests: the first inserts an entry, later ones append their
     // completion, and all fire together when the single fetch finishes.
     private let inFlight = Mutex<[ImageRequest: [UncheckedSendableBox<(PlatformImage?) -> Void>]]>([:])
+    private let currentDownloadByteLimit: Mutex<Int>
+
+    /// The default `downloadByteLimit`: 32 MB, past any photo a web page shows. A raw camera file or a photo
+    /// saved with little compression can be larger; a host that shows those raises the limit.
+    public static let defaultDownloadByteLimit = 32 * 1024 * 1024
+
+    /// The most bytes one http or https download may bring, so a server cannot fill memory with an endless or
+    /// huge body. A response that declares a larger size is refused at once, and one that sends more is cut off
+    /// when it passes the limit; the load then delivers nil, as for a failed download, and nothing is cached.
+    /// Images read from a file or a data: URL, and bytes already in the cache, are not limited. Thread-safe; a
+    /// new value applies to downloads that start after it is set, so a host sets it at launch, for example
+    /// `ImageStore.shared.downloadByteLimit = 200 * 1024 * 1024` for raw camera files. A negative value counts
+    /// as 0; `Int.max` removes the limit.
+    public var downloadByteLimit: Int {
+        get {
+            currentDownloadByteLimit.withLock { $0 }
+        }
+        set {
+            currentDownloadByteLimit.withLock { $0 = max(0, newValue) }
+        }
+    }
 
     /// - Parameters:
     ///   - name: names the on-disk subfolder and work queue; distinct names are fully independent caches.
@@ -69,10 +90,13 @@ public final class ImageStore: @unchecked Sendable {
     ///     `recommendedMemoryByteLimit()`. Set it above the largest single decoded image you expect, or that
     ///     image cannot stay resident.
     ///   - diskByteLimit: soft byte budget for the on-disk original bytes.
+    ///   - downloadByteLimit: the most bytes one http or https download may bring (see `downloadByteLimit`).
     public init(name: String = "default",
                 memoryCountLimit: Int = 150,
                 memoryByteLimit: Int = ImageStore.recommendedMemoryByteLimit(),
-                diskByteLimit: Int = 200 * 1024 * 1024) {
+                diskByteLimit: Int = 200 * 1024 * 1024,
+                downloadByteLimit: Int = ImageStore.defaultDownloadByteLimit) {
+        currentDownloadByteLimit = Mutex(max(0, downloadByteLimit))
         let costLimit = max(0, memoryByteLimit)
         variantCache = MemoryCache(countLimit: memoryCountLimit, costLimit: costLimit)
         originalCache = MemoryCache(countLimit: memoryCountLimit, costLimit: costLimit)
@@ -236,7 +260,7 @@ public final class ImageStore: @unchecked Sendable {
         case "data":
             finishProduction(request, bytes: Self.decodeDataURL(url.absoluteString), writeDisk: true, version: version)
         case "http", "https":
-            HTTPLoader.fetch(url.absoluteString) { [self] bytes in
+            HTTPLoader.fetch(url.absoluteString, limit: downloadByteLimit) { [self] bytes in
                 workQueue.async { [self] in
                     finishProduction(request, bytes: bytes, writeDisk: true, version: version)
                 }
@@ -347,52 +371,15 @@ private enum HTTPLoader {
     // Touched only on the main context's thread (inside MainContext.async and libsoup's callbacks).
     nonisolated(unsafe) private static var session: UnsafeMutablePointer<SoupSession>?
 
-    private final class Pending {
-        let message: OpaquePointer
-        let done: @Sendable (Data?) -> Void
-        init(message: OpaquePointer, done: @escaping @Sendable (Data?) -> Void) {
-            self.message = message
-            self.done = done
-        }
-    }
-
-    // The response body worth caching, or nil: a status outside 200-299 is rejected, so an error page (some
-    // CDNs serve a placeholder image or an HTML error with a 404/500) is never decoded or persisted.
-    private static let ready: @convention(c) (UnsafeMutablePointer<GObject>?, OpaquePointer?, gpointer?) -> Void = {
-        source, result, data in
-        guard let data else {
-            return
-        }
-        let pending = Unmanaged<Pending>.fromOpaque(data).takeRetainedValue()
-        var error: UnsafeMutablePointer<GError>?
-        let bytes = soup_session_send_and_read_finish(UnsafeMutableRawPointer(source)?.assumingMemoryBound(to: SoupSession.self),
-                                                      result, &error)
-        if let error {
-            g_error_free(error)
-        }
-        let status = soup_message_get_status(pending.message).rawValue
-        g_object_unref(UnsafeMutableRawPointer(pending.message))
-        var body: Data?
-        if let bytes {
-            var size: gsize = 0
-            if (200...299).contains(status), let start = g_bytes_get_data(bytes, &size), size > 0 {
-                body = Data(bytes: start, count: Int(size))
-            }
-            g_bytes_unref(bytes)
-        }
-        pending.done(body)
-    }
-
-    /// Fetches `url` and passes the body (or nil) to `done`, which runs on the main context's thread.
-    static func fetch(_ url: String, _ done: @escaping @Sendable (Data?) -> Void) {
+    /// Fetches `url`, reading at most `limit` bytes of body, and passes the body (or nil) to `done`, which runs on
+    /// the main context's thread.
+    static func fetch(_ url: String, limit: Int, _ done: @escaping @Sendable (Data?) -> Void) {
         MainContext.async {
             guard let message = soup_message_new("GET", url) else {
                 done(nil)
                 return
             }
-            let session = sharedSession()
-            let pending = Unmanaged.passRetained(Pending(message: message, done: done)).toOpaque()
-            soup_session_send_and_read_async(session, message, G_PRIORITY_DEFAULT, nil, ready, pending)
+            Download(session: sharedSession(), message: message, address: url, limit: limit, done: done).send()
         }
     }
 
@@ -432,5 +419,169 @@ private enum HTTPLoader {
         }
         var pointers = copies.map { UnsafePointer($0) }
         return pointers.withUnsafeMutableBufferPointer { body($0.baseAddress!) }
+    }
+}
+
+// The closure a GLib asynchronous call runs when it ends, given the call's GAsyncResult.
+private final class Ready {
+    let run: (OpaquePointer?) -> Void
+    init(_ run: @escaping (OpaquePointer?) -> Void) {
+        self.run = run
+    }
+
+    /// A retained pointer for the call's user data; readyTrampoline releases it.
+    var retainedPointer: gpointer {
+        Unmanaged.passRetained(self).toOpaque()
+    }
+}
+
+private let readyTrampoline: @convention(c) (UnsafeMutablePointer<GObject>?, OpaquePointer?, gpointer?) -> Void = {
+    _, result, data in
+    guard let data else {
+        return
+    }
+    Unmanaged<Ready>.fromOpaque(data).takeRetainedValue().run(result)
+}
+
+// One http or https download, on the main context's thread. It sends the request, follows redirects itself (libsoup's
+// own following reads a redirect's whole body into memory, outside any limit), refuses a status outside 200-299 (so an
+// error page, which some CDNs serve as an image, is never decoded or persisted) and a body that declares or brings more
+// than `limit` bytes, and passes the body or nil to `done` once. The callbacks it registers keep it alive until then.
+private final class Download {
+    private let session: UnsafeMutablePointer<SoupSession>
+    private let limit: Int
+    private let done: @Sendable (Data?) -> Void
+    /// The request being sent: the first one, then each redirect's.
+    private var message: OpaquePointer
+    /// The address `message` asks for, which a relative redirect is read against.
+    private var address: String
+    /// `message`'s body. Released before its end, it closes the connection: an endless body stops at once.
+    private var stream: UnsafeMutablePointer<GInputStream>?
+    private var body = Data()
+    private var redirects = 0
+    private var finished = false
+
+    private static let pieceSize = 64 * 1024
+    /// The most redirects one download follows, as libsoup's own following does.
+    private static let maximumRedirects = 20
+    /// The statuses that redirect a GET, as libsoup's own following reads them.
+    private static let redirectStatuses: Set<UInt32> = [301, 302, 303, 307, 308]
+
+    init(session: UnsafeMutablePointer<SoupSession>, message: OpaquePointer, address: String, limit: Int,
+         done: @escaping @Sendable (Data?) -> Void) {
+        self.session = session
+        self.message = message
+        self.address = address
+        self.limit = limit
+        self.done = done
+    }
+
+    /// Sends `message`, then reads its body, or follows its redirect.
+    func send() {
+        soup_message_add_flags(message, SOUP_MESSAGE_NO_REDIRECT)
+        let ready = Ready { [self] result in
+            var error: UnsafeMutablePointer<GError>?
+            stream = soup_session_send_finish(session, result, &error)
+            if let error {
+                g_error_free(error)
+            }
+            guard stream != nil else {
+                return finish(nil)
+            }
+            let status = UInt32(soup_message_get_status(message).rawValue)
+            if Self.redirectStatuses.contains(status) {
+                return followRedirect()
+            }
+            let headers = soup_message_get_response_headers(message)
+            let declared = soup_message_headers_get_encoding(headers) == SOUP_ENCODING_CONTENT_LENGTH
+                ? soup_message_headers_get_content_length(headers) : -1
+            guard (200...299).contains(status), declared <= goffset(limit) else {
+                return finish(nil)
+            }
+            readPiece()
+        }
+        soup_session_send_async(session, message, G_PRIORITY_DEFAULT, nil, readyTrampoline, ready.retainedPointer)
+    }
+
+    /// Sends a new request to the Location of `message`'s redirect response, unless the download has followed too
+    /// many, or the new address is not http or https.
+    private func followRedirect() {
+        guard redirects < Self.maximumRedirects,
+              let location = soup_message_headers_get_one(soup_message_get_response_headers(message), "Location") else {
+            return finish(nil)
+        }
+        // G_URI_FLAGS_ENCODED (1 << 3): escapes in the Location are kept as they are, for libsoup to read.
+        var error: UnsafeMutablePointer<GError>?
+        let resolved = g_uri_resolve_relative(address, location, GUriFlags(rawValue: 1 << 3), &error)
+        if let error {
+            g_error_free(error)
+        }
+        guard let resolved else {
+            return finish(nil)
+        }
+        let next = String(cString: resolved)
+        g_free(resolved)
+        // Lowercase and interned by GLib: not freed.
+        let scheme = g_uri_peek_scheme(next).map { String(cString: $0) }
+        guard scheme == "http" || scheme == "https", let nextMessage = soup_message_new("GET", next) else {
+            return finish(nil)
+        }
+        // The redirect's own body is dropped unread.
+        releaseRequest()
+        message = nextMessage
+        address = next
+        redirects += 1
+        send()
+    }
+
+    private func readPiece() {
+        guard let stream else {
+            return finish(nil)
+        }
+        let ready = Ready { [self] result in
+            var error: UnsafeMutablePointer<GError>?
+            let piece = g_input_stream_read_bytes_finish(stream, result, &error)
+            if let error {
+                g_error_free(error)
+            }
+            guard let piece else {
+                return finish(nil)
+            }
+            defer {
+                g_bytes_unref(piece)
+            }
+            var size: gsize = 0
+            let start = g_bytes_get_data(piece, &size)
+            if size == 0 {
+                return finish(body)
+            }
+            guard Int(size) <= limit - body.count else {
+                return finish(nil)
+            }
+            if let start {
+                body.append(start.assumingMemoryBound(to: UInt8.self), count: Int(size))
+            }
+            readPiece()
+        }
+        g_input_stream_read_bytes_async(stream, gsize(Self.pieceSize), G_PRIORITY_DEFAULT, nil, readyTrampoline,
+                                        ready.retainedPointer)
+    }
+
+    /// Releases `message` and its body stream.
+    private func releaseRequest() {
+        if let stream {
+            g_object_unref(UnsafeMutableRawPointer(stream))
+            self.stream = nil
+        }
+        g_object_unref(UnsafeMutableRawPointer(message))
+    }
+
+    private func finish(_ data: Data?) {
+        guard !finished else {
+            return
+        }
+        finished = true
+        releaseRequest()
+        done(data.flatMap { $0.isEmpty ? nil : $0 })
     }
 }
