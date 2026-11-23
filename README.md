@@ -123,6 +123,12 @@ A server can send a huge body, or one that never ends, so one http or https down
 ImageStore.shared.downloadByteLimit = 200 * 1024 * 1024
 ```
 
+The Android port has the same setting, in bytes as a Long (`ImageStore.DEFAULT_DOWNLOAD_BYTE_LIMIT`, `downloadByteLimit` on the store and in its constructor); content: URLs are not limited either:
+
+```kotlin
+ImageStore.shared(context).downloadByteLimit = 200L * 1024 * 1024
+```
+
 ## Linux
 
 On Linux the same `AsyncImageCache` module builds over the platform's own libraries, found through pkg-config: GTK 4 (`gtk4`, which brings GLib and GdkPixbuf) and libsoup 3 (`libsoup-3.0`). It uses FoundationEssentials only, so a program that links it carries no ICU data. The oldest versions supported are GNOME 48's: GTK 4.18, GLib 2.84 and libsoup 3.6. https needs the GIO TLS backend, glib-networking, which GNOME desktops install.

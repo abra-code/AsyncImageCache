@@ -257,6 +257,103 @@ class ImageStoreInstrumentedTest {
         }
     }
 
+    // --- Download size limit ---
+
+    @Test fun downloadByteLimitDefaultsSetsAndClamps() {
+        val store = ImageStore(context, uniqueName())
+        assertEquals(32L * 1024 * 1024, store.downloadByteLimit)
+        assertEquals(32L * 1024 * 1024, ImageStore.DEFAULT_DOWNLOAD_BYTE_LIMIT)
+        store.downloadByteLimit = 500L * 1024 * 1024
+        assertEquals(500L * 1024 * 1024, store.downloadByteLimit)
+        store.downloadByteLimit = -5
+        assertEquals("a negative limit counts as 0", 0L, store.downloadByteLimit)
+        assertEquals(1000L, ImageStore(context, uniqueName(), downloadByteLimit = 1000).downloadByteLimit)
+        assertEquals(0L, ImageStore(context, uniqueName(), downloadByteLimit = -1).downloadByteLimit)
+    }
+
+    // A body one byte past the limit is refused, whether it declares its length or not, and nothing is cached;
+    // with the limit raised to the body's size the same address loads.
+    @Test fun aDownloadPastItsLimitIsRefusedUntilTheLimitIsRaised() {
+        val png = pngBytes(40, 20)
+        val server = TestHttpServer { path ->
+            TestHttpServer.Response(200, png, contentLength = if (path == "/sized.png") png.size.toLong() else null)
+        }
+        server.start()
+        try {
+            for (path in listOf("/sized.png", "/unsized.png")) {
+                val store = ImageStore(context, uniqueName(), downloadByteLimit = png.size - 1L)
+                try {
+                    val request = ImageRequest(server.url(path))
+                    assertNull(path, loadBlocking(store, request))
+                    assertFalse(path, store.diskFileExists(request.url))
+                    store.downloadByteLimit = png.size.toLong()
+                    val bitmap = loadBlocking(store, request)
+                    assertNotNull(path, bitmap)
+                    assertEquals(path, Size(40, 20), store.cachedPixelSize(request.url))
+                    assertTrue(path, store.diskFileExists(request.url))
+                } finally {
+                    store.removeAll()
+                }
+            }
+        } finally {
+            server.stop()
+        }
+    }
+
+    // A declared length past the limit ends the download before its body is read. The server declares a gigabyte
+    // but sends only the picture and then waits, so a download that read the body would wait for its read timeout.
+    @Test fun aDeclaredLengthPastTheLimitIsRefusedAtOnce() {
+        val server = TestHttpServer {
+            TestHttpServer.Response(200, pngBytes(4, 4), contentLength = 1L shl 30, holdOpenMs = 40_000)
+        }
+        server.start()
+        val store = ImageStore(context, uniqueName())
+        try {
+            val start = System.nanoTime()
+            assertNull(loadBlocking(store, ImageRequest(server.url("/huge.png")), timeoutMs = 10_000))
+            assertTrue(System.nanoTime() - start < 5_000_000_000L)
+        } finally {
+            store.removeAll()
+            server.stop()
+        }
+    }
+
+    @Test fun anEndlessBodyIsCutOff() {
+        val server = TestHttpServer { TestHttpServer.Response(200, pngBytes(4, 4), contentLength = null, endless = true) }
+        server.start()
+        val store = ImageStore(context, uniqueName(), downloadByteLimit = 1L shl 20)
+        try {
+            assertNull(loadBlocking(store, ImageRequest(server.url("/endless.png")), timeoutMs = 10_000))
+        } finally {
+            store.removeAll()
+            server.stop()
+        }
+    }
+
+    // A redirect is followed and its own body is not kept: here it never ends.
+    @Test fun aRedirectWithAnEndlessBodyIsFollowed() {
+        val png = pngBytes(12, 6)
+        val server = TestHttpServer { path ->
+            if (path == "/ok.png") {
+                TestHttpServer.Response(200, png)
+            } else {
+                TestHttpServer.Response(302, ByteArray(0), contentLength = null, extraHeaders = listOf("Location: /ok.png"),
+                                        endless = true)
+            }
+        }
+        server.start()
+        val store = ImageStore(context, uniqueName())
+        try {
+            val request = ImageRequest(server.url("/redirect.png"))
+            assertNotNull("the redirect is followed", loadBlocking(store, request, timeoutMs = 10_000))
+            assertEquals(Size(12, 6), store.cachedPixelSize(request.url))
+            assertEquals("the redirect, then its target", 2, server.requestCount)
+        } finally {
+            store.removeAll()
+            server.stop()
+        }
+    }
+
     // --- Trim under a tiny disk budget ---
 
     @Test fun diskTrimEvictsUnderTinyBudget() {

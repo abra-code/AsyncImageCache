@@ -36,7 +36,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
@@ -62,6 +64,7 @@ class ImageStore(
     memoryCountLimit: Int = DEFAULT_MEMORY_COUNT_LIMIT,
     memoryByteLimit: Long = recommendedMemoryByteLimit(context),
     diskByteLimit: Long = DEFAULT_DISK_BYTE_LIMIT,
+    downloadByteLimit: Long = DEFAULT_DOWNLOAD_BYTE_LIMIT,
 ) {
     // Application context: needed for cacheDir + the memory-pressure callback; never leak an Activity.
     private val appContext: Context = context.applicationContext
@@ -92,6 +95,23 @@ class ImageStore(
     // completion, and all fire together when the single fetch finishes. Guarded by `lock`.
     private val lock = ReentrantLock()
     private val inFlight = HashMap<ImageRequest, MutableList<(Bitmap?) -> Unit>>()
+
+    @Volatile private var currentDownloadByteLimit = maxOf(0L, downloadByteLimit)
+
+    /**
+     * The most bytes one http or https download may bring, so a server cannot fill memory with an endless or huge
+     * body. A response that declares a larger size is refused at once, and one that sends more is cut off when it
+     * passes the limit; the load then delivers null, as for a failed download, and nothing is cached. Images read
+     * from a file, a content: or a data: URL, and bytes already in the cache, are not limited. Thread-safe; a new
+     * value applies to downloads that start after it is set, so a host sets it at launch, for example
+     * `ImageStore.shared(context).downloadByteLimit = 200L * 1024 * 1024` for raw camera files. A negative value
+     * counts as 0; `Long.MAX_VALUE` removes the limit (a body still has to fit in one array).
+     */
+    var downloadByteLimit: Long
+        get() = currentDownloadByteLimit
+        set(value) {
+            currentDownloadByteLimit = maxOf(0L, value)
+        }
 
     // Memory-pressure hook - the explicit Android analog of NSCache's automatic purge (porting plan section 8).
     // The TRIM_MEMORY_* levels are deprecated as of API 34 but remain the mechanism for proportional eviction on
@@ -275,7 +295,7 @@ class ImageStore(
         val bytes = withContext(Dispatchers.IO) {
             when (scheme) {
                 "data", "file", "content" -> resolveLocalBytes(url, scheme)
-                else -> fetchRemote(url)
+                else -> fetchRemote(url, downloadByteLimit)
             }
         }
         finishProduction(request, bytes, writeDisk = true, version = version)
@@ -357,10 +377,12 @@ class ImageStore(
 
     // --- Byte sources ---
 
-    // Fetch remote bytes over HTTP(S). Bypasses any shared cache (we own caching - no double cache, mirroring
-    // the Swift `urlCache = nil`). A non-2xx status is rejected so an error page (some CDNs serve a placeholder
-    // image or an HTML error with a 404/500) is never decoded into a "successful" variant or persisted to disk.
-    private fun fetchRemote(url: String): ByteArray? {
+    // Fetch remote bytes over HTTP(S), at most `limit` of them. Bypasses any shared cache (we own caching - no
+    // double cache, mirroring the Swift `urlCache = nil`). A non-2xx status is rejected so an error page (some CDNs
+    // serve a placeholder image or an HTML error with a 404/500) is never decoded into a "successful" variant or
+    // persisted to disk. A declared length past the limit is refused before the body is read. Redirects are
+    // followed by HttpURLConnection, which discards a redirect's body rather than keeping it.
+    private fun fetchRemote(url: String, limit: Long): ByteArray? {
         val connection = try {
             (URL(url).openConnection() as HttpURLConnection)
         } catch (t: Throwable) {
@@ -371,10 +393,11 @@ class ImageStore(
             connection.connectTimeout = CONNECT_TIMEOUT_MS
             connection.readTimeout = READ_TIMEOUT_MS
             connection.connect()
-            if (connection.responseCode !in 200..299) {
+            val declared = connection.contentLengthLong
+            if (connection.responseCode !in 200..299 || declared > limit) {
                 return null
             }
-            connection.inputStream.use { it.readBytes() }
+            connection.inputStream.use { readAtMost(it, limit, expected = declared) }
         } catch (t: Throwable) {
             null
         } finally {
@@ -417,6 +440,12 @@ class ImageStore(
         const val DEFAULT_MEMORY_COUNT_LIMIT = 150
         const val DEFAULT_DISK_BYTE_LIMIT = 200L * 1024 * 1024
 
+        /**
+         * The default `downloadByteLimit`: 32 MB, past any photo a web page shows. A raw camera file or a photo
+         * saved with little compression can be larger; a host that shows those raises the limit.
+         */
+        const val DEFAULT_DOWNLOAD_BYTE_LIMIT = 32L * 1024 * 1024
+
         // A local file's modification time and size, appended to its memory keys so an edited file misses the old
         // entries; "" for every other scheme, content: included (no cheap way to ask a provider whether its data
         // changed), and for a file that is gone. One stat per lookup. A same-size rewrite within the file system's
@@ -435,6 +464,27 @@ class ImageStore(
         }
 
         internal fun originalKey(url: String, version: String): String = url + version
+
+        // The bytes of `input` to its end, or null once they pass `limit`. With gzip the counted bytes are the
+        // decoded ones (HttpURLConnection decodes transparently), so a small body that decodes to a huge one is
+        // still cut off. `expected`, the declared length (-1 when none), sizes the buffer up front, so a large body
+        // is not copied each time the buffer doubles; a wrong one costs only that.
+        internal fun readAtMost(input: InputStream, limit: Long, expected: Long = -1): ByteArray? {
+            val out = ByteArrayOutputStream(if (expected in 1..minOf(limit, Int.MAX_VALUE.toLong())) expected.toInt() else 32)
+            val buffer = ByteArray(64 * 1024)
+            var total = 0L
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) {
+                    return out.toByteArray()
+                }
+                if (count > limit - total) {
+                    return null
+                }
+                total += count
+                out.write(buffer, 0, count)
+            }
+        }
 
         internal fun variantKey(request: ImageRequest, version: String): String = request.variantKey + version
 
