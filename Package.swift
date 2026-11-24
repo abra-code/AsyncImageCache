@@ -10,13 +10,18 @@
 // only: the Apple engine files (CoreGraphics, ImageIO, CryptoKit, UIKit/AppKit, SwiftUI) are not compiled,
 // and the Linux/ folders hold the Linux engine and its tests.
 //
+// On Windows the module is built from the same portable value types and the portable files of Linux/ (the memory
+// cache, the sidecar codec, the animation and orientation readers), over Windows' own libraries: WIC (Windows
+// Imaging Component, in Swift's WinSDK module) decodes, WinHTTP fetches and BCrypt hashes (through
+// CAsyncImageCacheWindows, a module of this package's own: WinSDK has neither). The Windows/ folders hold the
+// Windows engine and its tests.
+//
 // See README.md for the API, design, and performance notes.
 
 import PackageDescription
 
-#if os(Linux)
 // The Apple-only sources of the AsyncImageCache target and its tests. A new Apple-only file must be added
-// here, or the Linux build fails on its Apple imports.
+// here, or the Linux and Windows builds fail on its Apple imports.
 let appleOnlySources = [
     "CachedImage.swift",
     "DiskCache.swift",
@@ -28,6 +33,8 @@ let appleOnlyTests = [
     "AsyncImageCacheTests.swift",
     "FixtureEmitterTests.swift",
 ]
+
+#if os(Linux)
 
 let package = Package(
     name: "AsyncImageCache",
@@ -41,12 +48,42 @@ let package = Package(
         .target(
             name: "AsyncImageCache",
             dependencies: ["CAsyncImageCacheGtk", "CAsyncImageCacheSoup"],
-            exclude: appleOnlySources
+            exclude: appleOnlySources + ["Windows"]
         ),
         .testTarget(
             name: "AsyncImageCacheTests",
             dependencies: ["AsyncImageCache", "CAsyncImageCacheGtk"],
-            exclude: appleOnlyTests
+            exclude: appleOnlyTests + ["Windows"]
+        ),
+    ]
+)
+#elseif os(Windows)
+// The Linux engine's files that use GTK, GLib or libsoup; the rest of Linux/ is portable and built here too.
+let linuxOnlySources = [
+    "Linux/DiskCache+Linux.swift",
+    "Linux/ImageProcessing+Linux.swift",
+    "Linux/ImageStore+Linux.swift",
+    "Linux/MainContext.swift",
+    "Linux/PlatformImage+Linux.swift",
+]
+
+let package = Package(
+    name: "AsyncImageCache",
+    products: [
+        .library(name: "AsyncImageCache", targets: ["AsyncImageCache"]),
+    ],
+    targets: [
+        // WinHTTP and BCrypt, for the Windows engine.
+        .systemLibrary(name: "CAsyncImageCacheWindows"),
+        .target(
+            name: "AsyncImageCache",
+            dependencies: ["CAsyncImageCacheWindows"],
+            exclude: appleOnlySources + linuxOnlySources
+        ),
+        .testTarget(
+            name: "AsyncImageCacheTests",
+            dependencies: ["AsyncImageCache"],
+            exclude: appleOnlyTests + ["Linux"]
         ),
     ]
 )
@@ -62,9 +99,9 @@ let package = Package(
         .library(name: "AsyncImageCache", targets: ["AsyncImageCache"]),
     ],
     targets: [
-        // The Linux engine and its tests (in Linux/ folders) are not built here.
-        .target(name: "AsyncImageCache", exclude: ["Linux"]),
-        .testTarget(name: "AsyncImageCacheTests", dependencies: ["AsyncImageCache"], exclude: ["Linux"]),
+        // The Linux and Windows engines and their tests (in Linux/ and Windows/ folders) are not built here.
+        .target(name: "AsyncImageCache", exclude: ["Linux", "Windows"]),
+        .testTarget(name: "AsyncImageCacheTests", dependencies: ["AsyncImageCache"], exclude: ["Linux", "Windows"]),
     ]
 )
 #endif

@@ -1,0 +1,10 @@
+module CAsyncImageCacheWindows [system] {
+    header "CAsyncImageCacheWindows.h"
+    link "winhttp"
+    link "bcrypt"
+    // CoCreateInstance, for WIC's factory (WinSDK's COM headers may not link it themselves).
+    link "ole32"
+    // RoActivateInstance, RoGetActivationFactory and the WinRT strings.
+    link "runtimeobject"
+    export *
+}

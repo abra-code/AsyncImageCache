@@ -1,6 +1,6 @@
 # AsyncImageCache
 
-A small, reusable async image loading + caching component for iOS / macOS / visionOS, and for GTK 4 programs on Linux. Shipped as a separate SPM library product so any consumer (RichText inline images, an
+A small, reusable async image loading + caching component for iOS / macOS / visionOS, for GTK 4 programs on Linux, and for Windows programs. Shipped as a separate SPM library product so any consumer (RichText inline images, an
 ActionUIChat image bubble, a standalone image element) can depend on just this.
 
 Two design goals drive everything:
@@ -145,6 +145,22 @@ The API is the one above, with these differences:
 - `CachedImage` (the SwiftUI view) is Apple-only.
 
 Tests run with `swift test` on Linux too. The shared fixtures (`Fixtures/`) hold Linux to the same decoded values as Apple platforms and Android.
+
+## Windows
+
+On Windows the same `AsyncImageCache` module builds over Windows' own libraries: WIC (Windows Imaging Component, in Swift's WinSDK module) decodes, WinHTTP fetches and BCrypt hashes, through `CAsyncImageCacheWindows`, a module of this package's own (WinSDK has neither WinHTTP nor BCrypt). It needs Windows 10 or later.
+
+The API is the Linux one above (`ImageSize`, `ImageLength` as Double), with these differences:
+
+- `PlatformImage` is the image a WinUI 3 program shows: `pixelWidth`, `pixelHeight` and, on the main thread, `imageSource`, a borrowed `IInspectable *` of a WinUI `SoftwareBitmapSource` to set as an Image's `Source`. Every element that shows the image shares that one source, so its pixels are held once. The decode, scaling and corners stay on the work queue, the pixels end in a Windows `SoftwareBitmap` there, and only the WinUI source is made on the main thread, which WinUI requires. The program must have started the Windows App SDK, and its main dispatch queue must be drained on its UI thread; without WinUI (a test) `imageSource` is nil. The package links nothing of the Windows App SDK: WinUI is reached through WinRT activation at run time.
+- Completions run on the main dispatch queue. A program that uses the store drains that queue from its message loop; tests run the main run loop while they wait.
+- Decoding goes through WIC (PNG, JPEG, GIF, BMP, TIFF, ICO, JPEG XR, and codecs the system adds, such as HEIF and WebP). WIC does not apply the EXIF orientation, so the decode turns the pixels itself. WIC's Fant scaler shrinks variants and makes the placeholder grid.
+- The disk cache lives in `%LOCALAPPDATA%\AsyncImageCache\<name>\` (FileManager's caches folder is the temporary folder on Windows, which the system empties), with the same file names and `.meta` files as on Linux.
+- A file: URL is read from the path Windows opens for it: with a host, a file on that server's share (`file://server/share/a.png`). A host program that shows content it does not trust judges that path before it asks the store. Only regular files are read, never a device such as NUL or CON.
+- http and https go through one WinHTTP session, synchronously on a network queue, at most six downloads at a time. A download carries none of the user's identity: no cookies, no automatic Windows sign-in (to a server or a proxy) and no answers to sign-in challenges. It follows redirects itself (up to 20, http and https only), holds the body to the download limit, and allows each step 60 seconds. The system's proxy settings are used.
+- As on Linux, the memory limits are the whole bound, and `CachedImage` (the SwiftUI view) is Apple-only.
+
+Tests run with `swift test` on Windows too, against the same shared fixtures.
 
 ## Performance (dimensions of 100 cached ~1024x768 gradient JPEGs)
 
