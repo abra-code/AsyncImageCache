@@ -158,6 +158,35 @@ final class WindowsImageStoreTests: XCTestCase {
         XCTAssertEqual(image.pixelBytes, pixels, "read back unchanged")
     }
 
+    // A variant without corners keeps the image's encoded bytes for WinUI to decode at its size (one copy of the
+    // pixels in WinUI); with corners, its pixels go into a SoftwareBitmap. A test process has no WinUI, so the bytes
+    // stay; decoded as WinUI would, they are the variant's size.
+    func testVariantKindFollowsTheCorners() throws {
+        let store = makeStore()
+        let url = dataURL(png: WindowsTestImages.png(width: 100, height: 50))
+        let plain = try XCTUnwrap(load(store, ImageRequest(url: url, targetWidth: 40)))
+        XCTAssertTrue(plain.holdsEncodedBytes, "the bytes wait for WinUI")
+        XCTAssertFalse(plain.holdsBitmap)
+        XCTAssertEqual([plain.pixelWidth, plain.pixelHeight], [40, 20])
+        XCTAssertEqual(plain.pixelBytes?.count, 40 * 20 * 4, "decoded at the variant's size")
+        let rounded = try XCTUnwrap(load(store, ImageRequest(url: url, targetWidth: 40, cornerRadius: 6)))
+        XCTAssertFalse(rounded.holdsEncodedBytes)
+        XCTAssertTrue(rounded.holdsBitmap, "corners are baked into pixels, held in a SoftwareBitmap")
+        XCTAssertEqual(rounded.pixelBytes.map { Array($0[0..<4]) }, [0, 0, 0, 0], "a cut corner is clear")
+    }
+
+    // An EXIF-rotated image on the encoded path has its displayed size (sides swapped), as WinUI shows it: the
+    // fixture is stored 100 x 40 with orientation 6, shown 40 x 100; asked 20 wide, 20 x 50.
+    func testRotatedImageKeepsItsDisplayedSize() throws {
+        let file = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Fixtures/images/exif-rotated.jpg")
+        let image = try XCTUnwrap(load(makeStore(), ImageRequest(url: file, targetWidth: 20)))
+        XCTAssertTrue(image.holdsEncodedBytes)
+        XCTAssertEqual([image.pixelWidth, image.pixelHeight], [20, 50])
+        XCTAssertEqual(image.pixelBytes?.count, 20 * 50 * 4)
+    }
+
     // A test process has not started the Windows App SDK, so it has no WinUI: no image source, and the image keeps
     // its bitmap. ActionUI's Windows CI shows the source in a WinUI program.
     @MainActor

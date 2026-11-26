@@ -11,6 +11,10 @@
 #include <inspectable.h>
 #include <roapi.h>
 #include <winstring.h>
+// An image's encoded bytes as the stream a WinUI BitmapImage reads: SHCreateMemStream (an IStream over a copy of the
+// bytes) and CreateRandomAccessStreamOverStream (that IStream as a Windows.Storage.Streams.IRandomAccessStream).
+#include <shlwapi.h>
+#include <shcore.h>
 
 // The few WinRT interfaces the store uses to hand a WinUI program a ready image, declared here as their C ABI:
 // Swift's WinSDK module has no WinRT types, and WinUI 3 ships no C headers. The IIDs, the method order (the vtable
@@ -122,6 +126,39 @@ typedef struct AICSoftwareBitmapSourceVtbl {
                                                 IInspectable **operation);
 } AICSoftwareBitmapSourceVtbl;
 struct AICSoftwareBitmapSource { const AICSoftwareBitmapSourceVtbl *lpVtbl; };
+
+// Microsoft.UI.Xaml.Media.Imaging.IBitmapImage (WinUI 3), 5CC29916-A411-5BC2-A3C5-A00D99A59DA8. A WinRT boolean is
+// one byte.
+typedef struct AICBitmapImage AICBitmapImage;
+typedef struct AICBitmapImageVtbl {
+    AIC_INSPECTABLE_SLOTS(AICBitmapImage)
+    void *get_CreateOptions;
+    void *put_CreateOptions;
+    void *get_UriSource;
+    void *put_UriSource;
+    void *get_DecodePixelWidth;
+    HRESULT (STDMETHODCALLTYPE *put_DecodePixelWidth)(AICBitmapImage *This, INT32 value);
+    void *get_DecodePixelHeight;
+    void *put_DecodePixelHeight;
+    void *get_DecodePixelType;
+    void *put_DecodePixelType;
+    void *get_IsAnimatedBitmap;
+    void *get_IsPlaying;
+    void *get_AutoPlay;
+    HRESULT (STDMETHODCALLTYPE *put_AutoPlay)(AICBitmapImage *This, BYTE value);
+} AICBitmapImageVtbl;
+struct AICBitmapImage { const AICBitmapImageVtbl *lpVtbl; };
+
+// Microsoft.UI.Xaml.Media.Imaging.IBitmapSource (WinUI 3), 8424269D-9B82-534F-8FEA-AF5B5EF96BF2. SetSource takes a
+// Windows.Storage.Streams.IRandomAccessStream (905A0FE1-BC53-11DF-8C49-001E4FC686DA).
+typedef struct AICBitmapSource AICBitmapSource;
+typedef struct AICBitmapSourceVtbl {
+    AIC_INSPECTABLE_SLOTS(AICBitmapSource)
+    void *get_PixelWidth;
+    void *get_PixelHeight;
+    HRESULT (STDMETHODCALLTYPE *SetSource)(AICBitmapSource *This, IInspectable *streamSource);
+} AICBitmapSourceVtbl;
+struct AICBitmapSource { const AICBitmapSourceVtbl *lpVtbl; };
 
 #undef AIC_INSPECTABLE_SLOTS
 

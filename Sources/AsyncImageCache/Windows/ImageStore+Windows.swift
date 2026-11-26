@@ -2,8 +2,9 @@
 //
 // The public entry point on Windows, the counterpart of ImageStore.swift with the same API as on Linux (ImageSize in
 // place of CGSize): an async image loader + two-tier cache. EVERYTHING heavy - byte fetch, decode, downscale,
-// corner-rounding - runs off the main thread, on a concurrent work queue and the network queue; the ONLY
-// main-thread work is the final completion callback, on the main dispatch queue. A program that uses the store
+// corner-rounding - runs off the main thread, on a concurrent work queue and the network queue (and a variant
+// without corners is decoded for display by WinUI, on its own threads); the ONLY main-thread work is handing WinUI
+// the image and the final completion callback, on the main dispatch queue. A program that uses the store
 // drains that queue (ActionUI's WinUI renderer does, from WinUI's message loop).
 //
 // Two tiers:
@@ -275,11 +276,20 @@ public final class ImageStore: @unchecked Sendable {
         var variant: PlatformImage?
         if let bytes, let decoded = ImageProcessing.decode(bytes) {
             recordOriginal(url: request.url, data: bytes, decoded: decoded, writeDisk: writeDisk, version: version)
-            if let built = ImageProcessing.variant(from: decoded,
-                                                   targetWidth: request.quantizedTargetWidth.map { ImageLength($0) },
-                                                   cornerRadius: ImageLength(request.quantizedCornerRadius)) {
-                // Into a SoftwareBitmap here, off the main thread, before anyone can see it.
-                built.prepareForDisplay()
+            let targetWidth = request.quantizedTargetWidth.map { ImageLength($0) }
+            let built: PlatformImage?
+            if request.quantizedCornerRadius > 0 {
+                // Corners are baked into pixels, which go into a SoftwareBitmap here, off the main thread, before
+                // anyone can see them.
+                built = ImageProcessing.variant(from: decoded, targetWidth: targetWidth,
+                                                cornerRadius: ImageLength(request.quantizedCornerRadius))
+                built?.prepareForDisplay()
+            } else {
+                // WinUI decodes the bytes itself, keeping one copy of the pixels; the decode here gave the size and
+                // the placeholder, and its pixels go with it.
+                built = ImageProcessing.encodedVariant(bytes, of: decoded, targetWidth: targetWidth)
+            }
+            if let built {
                 variantCache.setObject(built, forKey: Self.variantKey(request, version),
                                        cost: ImageProcessing.memoryCost(of: built))
                 variant = built

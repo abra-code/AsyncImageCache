@@ -1,12 +1,14 @@
 // Sources/AsyncImageCache/Windows/WinRTImage+Windows.swift
 //
-// The image a WinUI 3 program shows, made from a variant's pixels in two steps, so that only what WinUI requires runs
-// on its UI thread:
-//   1. On the work queue, the pixels go into a Windows.Graphics.Imaging.SoftwareBitmap (premultiplied BGRA8), a
-//      Windows type not tied to a thread. The pixel array is then freed.
-//   2. On the main thread (the UI thread a WinUI program drains the main dispatch queue on), a WinUI
-//      SoftwareBitmapSource takes the bitmap (SetBitmapAsync); the SoftwareBitmap is released after. Every element that
-//      shows the image shares that one source.
+// The image a WinUI 3 program shows, made on the main thread (the UI thread a WinUI program drains the main dispatch
+// queue on), which WinUI requires; every element that shows the image shares that one object:
+//   - from an image's encoded bytes (a variant without rounded corners): a WinUI BitmapImage, which decodes them on
+//     WinUI's own threads, at the variant's width (DecodePixelWidth), the EXIF orientation applied by WinUI, an
+//     animated image showing its first frame (AutoPlay off). WinUI then keeps one copy of the pixels.
+//   - from pixels (a variant with rounded corners baked in, a placeholder grid), in two steps: on the work queue the
+//     pixels go into a Windows.Graphics.Imaging.SoftwareBitmap (premultiplied BGRA8), a Windows type not tied to a
+//     thread, and the array is freed; on the main thread a WinUI SoftwareBitmapSource takes the bitmap
+//     (SetBitmapAsync), and the SoftwareBitmap is released after. WinUI keeps two copies of those pixels.
 // WinUI is reached only at run time, through WinRT activation: the package links no part of the Windows App SDK, and a
 // program that has not started it (a test) gets no source, only the bitmap.
 //
@@ -15,6 +17,11 @@
 
 #if os(Windows)
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
+import Foundation
+#endif
 import CAsyncImageCacheWindows
 import Dispatch
 import Synchronization
@@ -56,6 +63,12 @@ enum WinRT {
                                Data4: (0x83, 0xBB, 0xD7, 0x5B, 0xAE, 0x4E, 0xA9, 0x9E))
     static let softwareBitmapSource = GUID(Data1: 0xA6AC_A802, Data2: 0x1F24, Data3: 0x5A1E,
                                            Data4: (0xBF, 0x08, 0x78, 0x1A, 0x85, 0xED, 0x55, 0x11))
+    static let bitmapImage = GUID(Data1: 0x5CC2_9916, Data2: 0xA411, Data3: 0x5BC2,
+                                  Data4: (0xA3, 0xC5, 0xA0, 0x0D, 0x99, 0xA5, 0x9D, 0xA8))
+    static let bitmapSource = GUID(Data1: 0x8424_269D, Data2: 0x9B82, Data3: 0x534F,
+                                   Data4: (0x8F, 0xEA, 0xAF, 0x5B, 0x5E, 0xF9, 0x6B, 0xF2))
+    static let randomAccessStream = GUID(Data1: 0x905A_0FE1, Data2: 0xBC53, Data3: 0x11DF,
+                                         Data4: (0x8C, 0x49, 0x00, 0x1E, 0x4F, 0xC6, 0x86, 0xDA))
 
     /// Keeps the process's multithreaded apartment alive once a work queue thread has made a WinRT object in it, so
     /// the object outlives that thread's CoUninitialize.
@@ -149,6 +162,64 @@ enum WinRT {
         }
         if let operation {
             release(operation)
+        }
+        return object
+    }
+
+    /// A WinUI BitmapImage decoding `data` (an image's encoded bytes) to `decodeWidth` pixels wide when given (its
+    /// height in proportion), else at its own size; showing an animated image's first frame. nil when the program has
+    /// no WinUI or the bytes cannot be handed over. Main thread only: a WinUI object is made on its UI thread.
+    @MainActor
+    static func makeBitmapImage(_ data: Data, decodeWidth: Int?) -> WinRTObject? {
+        guard !data.isEmpty, data.count <= Int(UINT32.max) else {
+            return nil
+        }
+        var made: UnsafeMutablePointer<IInspectable>?
+        let activated = withString("Microsoft.UI.Xaml.Media.Imaging.BitmapImage") { name in
+            RoActivateInstance(name, &made)
+        }
+        guard activated >= 0, let made else {
+            return nil
+        }
+        let object = WinRTObject(adopting: UnsafeMutableRawPointer(made), releasesOnMain: true)
+        guard let image: UnsafeMutablePointer<AICBitmapImage> = query(made, bitmapImage) else {
+            return nil
+        }
+        defer {
+            release(image)
+        }
+        // Both before SetSource, which starts the decode.
+        _ = image.pointee.lpVtbl.pointee.put_AutoPlay!(image, 0)
+        if let decodeWidth, decodeWidth > 0, decodeWidth <= Int(Int32.max) {
+            _ = image.pointee.lpVtbl.pointee.put_DecodePixelWidth!(image, Int32(decodeWidth))
+        }
+        guard let source: UnsafeMutablePointer<AICBitmapSource> = query(made, bitmapSource) else {
+            return nil
+        }
+        defer {
+            release(source)
+        }
+        // A copy of the bytes in a memory stream, which the image holds while it needs it.
+        let memory = data.withUnsafeBytes { bytes in
+            SHCreateMemStream(bytes.baseAddress?.assumingMemoryBound(to: BYTE.self), UINT(bytes.count))
+        }
+        guard let memory else {
+            return nil
+        }
+        defer {
+            release(memory)
+        }
+        var interface = randomAccessStream
+        var stream: UnsafeMutableRawPointer?
+        guard CreateRandomAccessStreamOverStream(memory, BSOS_DEFAULT, &interface, &stream) >= 0, let stream else {
+            return nil
+        }
+        defer {
+            release(stream)
+        }
+        let typed = stream.assumingMemoryBound(to: IInspectable.self)
+        guard source.pointee.lpVtbl.pointee.SetSource!(source, typed) >= 0 else {
+            return nil
         }
         return object
     }

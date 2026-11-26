@@ -150,28 +150,13 @@ enum ImageProcessing {
     /// (never upscale; the height scales proportionally, rounded as on Apple platforms), and apply a rounded-
     /// corner mask when `cornerRadius > 0`. nil only if the scaled pixels cannot be made. Safe off the main thread.
     static func variant(from image: DecodedImage, targetWidth: ImageLength?, cornerRadius: ImageLength) -> PlatformImage? {
-        let naturalWidth = Double(image.width)
-        let naturalHeight = Double(image.height)
-        guard naturalWidth > 0, naturalHeight > 0 else {
+        guard let size = variantSize(of: image, targetWidth: targetWidth) else {
             return nil
         }
-        var width = naturalWidth
-        var height = naturalHeight
-        if let targetWidth, targetWidth > 0, naturalWidth > Double(targetWidth) {
-            let scale = Double(targetWidth) / naturalWidth
-            width = (naturalWidth * scale).rounded()
-            height = (naturalHeight * scale).rounded()
-        }
-        var pixelWidth = Int(width)
-        var pixelHeight = Int(height)
-        var radius = Double(cornerRadius)
-        if pixelWidth <= 0 || pixelHeight <= 0 {
-            // A side that rounds to nothing (a long thin strip): the image as it is, as Apple platforms and
-            // Android return their source.
-            pixelWidth = image.width
-            pixelHeight = image.height
-            radius = 0
-        }
+        let pixelWidth = size.width
+        let pixelHeight = size.height
+        // No corners on an image left at its own size because a side rounded to nothing.
+        let radius = size.isFallback ? 0 : Double(cornerRadius)
         var pixels: [UInt8]
         if pixelWidth == image.width, pixelHeight == image.height {
             // A copy on write: the mask below never writes into the shared original.
@@ -186,6 +171,41 @@ enum ImageProcessing {
                          radius: min(radius, Double(min(pixelWidth, pixelHeight)) / 2))
         }
         return PlatformImage(pixelWidth: pixelWidth, pixelHeight: pixelHeight, pixels: pixels)
+    }
+
+    /// The variant as encoded bytes for WinUI to decode (a BitmapImage), at the size `variant` would give it: `bytes`
+    /// are what `image` was decoded from. No corners: a host that wants them rounded clips the image, or asks for a
+    /// `cornerRadius` and gets pixels. nil only for an empty image.
+    static func encodedVariant(_ bytes: Data, of image: DecodedImage, targetWidth: ImageLength?) -> PlatformImage? {
+        guard let size = variantSize(of: image, targetWidth: targetWidth) else {
+            return nil
+        }
+        return PlatformImage(pixelWidth: size.width, pixelHeight: size.height, encoded: bytes,
+                             decodeWidth: size.width < image.width ? size.width : nil)
+    }
+
+    /// A variant's size: `image`'s, scaled down so its width is at most `targetWidth` (never up; the height scales
+    /// proportionally, rounded as on Apple platforms). A side that rounds to nothing (a long thin strip) leaves the
+    /// image at its own size, as Apple platforms and Android return their source (`isFallback`). nil for an empty
+    /// image.
+    private static func variantSize(of image: DecodedImage, targetWidth: ImageLength?)
+        -> (width: Int, height: Int, isFallback: Bool)? {
+        let naturalWidth = Double(image.width)
+        let naturalHeight = Double(image.height)
+        guard naturalWidth > 0, naturalHeight > 0 else {
+            return nil
+        }
+        var width = naturalWidth
+        var height = naturalHeight
+        if let targetWidth, targetWidth > 0, naturalWidth > Double(targetWidth) {
+            let scale = Double(targetWidth) / naturalWidth
+            width = (naturalWidth * scale).rounded()
+            height = (naturalHeight * scale).rounded()
+        }
+        guard Int(width) > 0, Int(height) > 0 else {
+            return (image.width, image.height, true)
+        }
+        return (Int(width), Int(height), false)
     }
 
     // MARK: - Pixels

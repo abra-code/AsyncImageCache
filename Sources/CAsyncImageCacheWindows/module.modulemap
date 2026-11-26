@@ -6,5 +6,8 @@ module CAsyncImageCacheWindows [system] {
     link "ole32"
     // RoActivateInstance, RoGetActivationFactory and the WinRT strings.
     link "runtimeobject"
+    // SHCreateMemStream and CreateRandomAccessStreamOverStream, for the bytes a WinUI BitmapImage reads.
+    link "shlwapi"
+    link "shcore"
     export *
 }
